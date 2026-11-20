@@ -5,7 +5,15 @@ CPU load per thread (P-cores and E-cores labelled), clock speed, memory, both GP
 fan speeds, CPU/GPU power draw, battery charge rate, disk, network, the busiest processes and a
 one-line "what's the bottleneck" insight.
 
-- **Small:** one ~100 KB exe, no installer framework, no runtime to download (it uses the .NET Framework 4.8 built into Windows).
+<p>
+  <img src="docs/screenshot.png" alt="CoreGlance standard view: CPU per thread, temperatures, fans, power, memory, GPUs, disk and network" width="318">
+  &nbsp;&nbsp;
+  <img src="docs/compact.png" alt="CoreGlance compact view: CPU, RAM and GPU rings with per-thread bars" width="236">
+</p>
+
+*Standard view (left, admin sensor mode with PawnIO on an Acer Aspire 5) and compact view (right).*
+
+- **Small:** one ~140 KB exe, no installer framework, no runtime to download (it uses the .NET Framework 4.8 built into Windows).
 - **Light:** about 0.1–0.3% CPU and ~10–20 MB of RAM at a 1 s refresh. The cost is shown at the bottom of the widget.
 - **Accurate:** CPU, GPU, disk and network numbers come from Windows performance counters, the same source Task Manager uses.
 
