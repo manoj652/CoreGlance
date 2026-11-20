@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Management;
@@ -12,9 +13,10 @@ using System.Windows.Forms;
 namespace CoreGlance
 {
     /// <summary>
-    /// Slow sensors polled on a background thread so the UI never waits on WMI or the NVIDIA driver:
-    /// Acer firmware (CPU/GPU/system temperature, fan RPM; needs admin), battery charge rate (WMI, no admin),
-    /// NVIDIA power/clock/temperature (NVML, only while the dGPU is already awake so it is never woken up).
+    /// Slow sensors polled on a background thread so the UI never waits on WMI, firmware or drivers.
+    /// Firmware/driver readings come from whichever providers this laptop supports (first one to report a value wins):
+    /// PawnIO CPU temps, then Acer / ASUS / Lenovo / HP / Dell firmware, then Dell SMM.
+    /// Also battery charge rate (WMI) and NVIDIA power/clock/temperature (NVML, only while the dGPU is awake).
     /// Values are NaN when unknown.
     /// </summary>
     sealed class Sensors : IDisposable
@@ -22,29 +24,32 @@ namespace CoreGlance
         public volatile bool Paused;
         public volatile bool NvidiaActive;   // set by the UI thread from GPU engine activity
 
-        public double CpuTemp = double.NaN, GpuTemp = double.NaN, SysTemp = double.NaN;
-        public double CpuFan = double.NaN, GpuFan = double.NaN;
+        public double CpuTemp = double.NaN, CoreMaxTemp = double.NaN, GpuTemp = double.NaN, SysTemp = double.NaN;
+        public double CpuFan = double.NaN, GpuFan = double.NaN, MidFan = double.NaN;
+        public string CpuTempSource = "";
         public double NvPowerW = double.NaN, NvClockMhz = double.NaN, NvTempC = double.NaN, NvFanPct = double.NaN;
         public double BatRateW = double.NaN, BatRemainWh = double.NaN, BatFullWh = double.NaN;
         public bool BatCharging, BatDischarging, BatOnline;
 
         public readonly bool Elevated;
-        public readonly bool AcerAvailable;   // the laptop exposes Acer's sensor interface
-        public bool AcerWorking;               // and we are reading it
+        public volatile bool Ready;              // provider detection finished
+        public volatile bool VendorDetected;     // a laptop-maker sensor interface exists (may need admin)
+        public volatile bool PawnIoInstalled;
+        public volatile string SourceList = "detecting...";
 
+        readonly List<KeyValuePair<int, int>> cores;
         readonly Thread thread;
         readonly ManualResetEvent stop = new ManualResetEvent(false);
-        ManagementObject acer;
-        uint acerSensors;     // bitmap: bit (id-1) set when sensor id is supported
-        DateTime acerRetry = DateTime.MinValue;
+        readonly List<SensorProvider> providers = new List<SensorProvider>();
+        readonly List<int> failures = new List<int>();
         bool nvmlLoaded, nvmlMissing;
         IntPtr nvDev;
         DateTime nvLastActive = DateTime.MinValue;
 
-        public Sensors()
+        public Sensors(List<KeyValuePair<int, int>> physicalCores)
         {
+            cores = physicalCores;
             Elevated = Elevation.IsElevated;
-            AcerAvailable = AcerClassExists();
             thread = new Thread(Run);
             thread.IsBackground = true;
             thread.Priority = ThreadPriority.BelowNormal;
@@ -52,15 +57,69 @@ namespace CoreGlance
             thread.Start();
         }
 
-        public bool AcerNeedsAdmin { get { return AcerAvailable && !Elevated; } }
+        /// <summary>Running as admin would unlock more readings on this laptop.</summary>
+        public bool NeedsAdmin { get { return Ready && !Elevated && (VendorDetected || PawnIoInstalled); } }
+
+        void Detect()
+        {
+            PawnIoInstalled = PawnModule.Installed;
+            string maker = "";
+            try
+            {
+                using (var s = new ManagementObjectSearcher("SELECT Manufacturer FROM Win32_ComputerSystem"))
+                    foreach (ManagementObject o in s.Get()) using (o) { maker = Convert.ToString(o["Manufacturer"]).ToLowerInvariant(); break; }
+            }
+            catch { }
+
+            if (PawnIoInstalled) TryAdd(delegate { return PawnCpuProvider.TryCreate(cores); });
+
+            bool acer = Io.WmiClassExists("AcerGamingFunction");
+            bool lenovo = Io.WmiClassExists("LENOVO_OTHER_METHOD") || Io.WmiClassExists("LENOVO_FAN_METHOD");
+            bool hp = Io.WmiClassExists("hpqBIntM") && maker.Contains("hp");
+            bool awcc = Io.WmiClassExists("AWCCWmiMethodFunction");
+            bool asus = maker.Contains("asus");
+            VendorDetected = acer || lenovo || hp || awcc || asus;
+
+            if (asus) TryAdd(delegate { return AsusProvider.TryCreate(); });
+            if (acer) TryAdd(delegate { return AcerProvider.TryCreate(); });
+            if (lenovo) TryAdd(delegate { return LenovoProvider.TryCreate(); });
+            if (hp) TryAdd(delegate { return HpProvider.TryCreate(); });
+            bool awccOk = awcc && TryAdd(delegate { return DellAwccProvider.TryCreate(); });
+            if (PawnIoInstalled && maker.Contains("dell") && !awccOk) TryAdd(delegate { return PawnDellSmmProvider.TryCreate(); });
+
+            var names = new List<string>();
+            foreach (SensorProvider p in providers) names.Add(p.Name);
+            SourceList = names.Count > 0 ? string.Join(", ", names.ToArray()) : "Windows counters only";
+            Ready = true;
+        }
+
+        delegate SensorProvider Factory();
+
+        bool TryAdd(Factory make)
+        {
+            try
+            {
+                SensorProvider p = make();
+                if (p == null) return false;
+                providers.Add(p);
+                failures.Add(0);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Settings.Log("sensor provider: " + ex.Message);
+                return false;
+            }
+        }
 
         void Run()
         {
+            try { Detect(); } catch (Exception ex) { Settings.Log("detect: " + ex); Ready = true; }
             int n = 0;
-            while (!stop.WaitOne(n == 0 ? 300 : 2000))
+            while (!stop.WaitOne(n == 0 ? 200 : 2000))
             {
                 if (Paused) continue;
-                try { if (Elevated && AcerAvailable) ReadAcer(); } catch (Exception ex) { Settings.Log("acer: " + ex.Message); }
+                try { ReadProviders(n); } catch (Exception ex) { Settings.Log("sensors: " + ex.Message); }
                 try { if (n % 2 == 0) ReadBattery(n % 30 == 0); } catch (Exception ex) { Settings.Log("battery: " + ex.Message); }
                 try { ReadNvml(); } catch (Exception ex) { Settings.Log("nvml: " + ex.Message); nvmlMissing = true; }
                 n++;
@@ -68,76 +127,37 @@ namespace CoreGlance
             NvmlOff();
         }
 
-        // ---------------- Acer (root\wmi AcerGamingFunction.GetGamingSysInfo, read-only) ----------------
+        SensorFrame last = new SensorFrame();
 
-        static bool AcerClassExists()
+        void ReadProviders(int n)
         {
-            try
+            if (providers.Count == 0) return;
+            var f = new SensorFrame();
+            for (int i = 0; i < providers.Count; i++)
             {
-                using (var c = new ManagementClass(@"root\wmi", "AcerGamingFunction", null))
+                SensorProvider p = providers[i];
+                if (failures[i] >= 5) continue;                // gave up on this one
+                if (n % p.PollEvery != 0) continue;
+                try { p.Read(f); failures[i] = 0; }
+                catch (Exception ex)
                 {
-                    c.Get();
-                    return true;
+                    failures[i]++;
+                    if (failures[i] == 5) Settings.Log(p.Name + " disabled: " + ex.Message);
                 }
             }
-            catch { return false; }
-        }
+            // Providers polled less often keep their last value in between.
+            if (double.IsNaN(f.CpuTemp)) { f.CpuTemp = last.CpuTemp; f.CpuTempSource = last.CpuTempSource; }
+            if (double.IsNaN(f.CoreMaxTemp)) f.CoreMaxTemp = last.CoreMaxTemp;
+            if (double.IsNaN(f.GpuTemp)) f.GpuTemp = last.GpuTemp;
+            if (double.IsNaN(f.SysTemp)) f.SysTemp = last.SysTemp;
+            if (double.IsNaN(f.CpuFan)) f.CpuFan = last.CpuFan;
+            if (double.IsNaN(f.GpuFan)) f.GpuFan = last.GpuFan;
+            if (double.IsNaN(f.MidFan)) f.MidFan = last.MidFan;
+            last = f;
 
-        void ReadAcer()
-        {
-            if (acer == null)
-            {
-                if (DateTime.UtcNow < acerRetry) return;
-                acerRetry = DateTime.UtcNow.AddSeconds(60);
-                using (var s = new ManagementObjectSearcher(@"root\wmi", "SELECT * FROM AcerGamingFunction"))
-                    foreach (ManagementObject o in s.Get()) { acer = o; break; }
-                if (acer == null) return;
-                ulong sup;
-                acerSensors = AcerQuery(0x0000, out sup) ? (uint)((sup >> 24) & 0x1FFFF) : 0x227;
-                if (acerSensors == 0) acerSensors = 0x227;
-            }
-            bool any = false;
-            CpuTemp = AcerSensor(0x01, ref any);
-            CpuFan = AcerSensor(0x02, ref any);
-            SysTemp = AcerSensor(0x03, ref any);
-            GpuFan = AcerSensor(0x06, ref any);
-            GpuTemp = AcerSensor(0x0A, ref any);
-            AcerWorking = any;
-        }
-
-        double AcerSensor(int id, ref bool any)
-        {
-            if ((acerSensors & (1u << (id - 1))) == 0) return double.NaN;
-            ulong r;
-            if (!AcerQuery((uint)(0x01 | (id << 8)), out r) || (r & 0xFF) != 0) return double.NaN;
-            double v = (r >> 8) & 0xFFFF;
-            bool temp = id == 0x01 || id == 0x03 || id == 0x0A;
-            if (temp && (v <= 0 || v > 125)) return double.NaN;
-            if (!temp && v > 20000) return double.NaN;
-            any = true;
-            return v;
-        }
-
-        bool AcerQuery(uint input, out ulong output)
-        {
-            output = 0;
-            try
-            {
-                using (ManagementBaseObject inP = acer.GetMethodParameters("GetGamingSysInfo"))
-                {
-                    inP["gmInput"] = input;
-                    using (ManagementBaseObject outP = acer.InvokeMethod("GetGamingSysInfo", inP, null))
-                    {
-                        output = Convert.ToUInt64(outP["gmOutput"]);
-                        return true;
-                    }
-                }
-            }
-            catch (ManagementException)
-            {
-                acer = null;   // e.g. access denied; retry later
-                return false;
-            }
+            CpuTemp = f.CpuTemp; CpuTempSource = f.CpuTempSource; CoreMaxTemp = f.CoreMaxTemp;
+            GpuTemp = f.GpuTemp; SysTemp = f.SysTemp;
+            CpuFan = f.CpuFan; GpuFan = f.GpuFan; MidFan = f.MidFan;
         }
 
         // ---------------- Battery (root\wmi BatteryStatus, no admin) ----------------
@@ -215,7 +235,7 @@ namespace CoreGlance
             stop.Set();
             thread.Join(3000);
             stop.Close();
-            if (acer != null) acer.Dispose();
+            foreach (SensorProvider p in providers) { try { p.Dispose(); } catch { } }
         }
     }
 
@@ -342,6 +362,30 @@ namespace CoreGlance
         }
 
         /// <summary>Asks for UAC once and runs this exe with the given switch elevated. Returns true on success.</summary>
+        /// <summary>Runs elevated (CoreGlance.exe --install-pawnio): installs the signed PawnIO driver from winget.</summary>
+        public static int InstallPawnIo()
+        {
+            if (PawnModule.Installed) return 0;
+            try
+            {
+                var psi = new ProcessStartInfo("winget.exe",
+                    "install --id namazso.PawnIO --exact --silent --accept-package-agreements --accept-source-agreements --disable-interactivity");
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                using (Process p = Process.Start(psi))
+                {
+                    if (!p.WaitForExit(300000)) { try { p.Kill(); } catch { } return 3; }
+                    if (p.ExitCode != 0) Settings.Log("winget PawnIO exit code " + p.ExitCode);
+                }
+            }
+            catch (Exception ex)
+            {
+                Settings.Log("install-pawnio: " + ex.Message);
+                return 1;
+            }
+            return PawnModule.Installed ? 0 : 2;
+        }
+
         public static bool RunElevated(string arg)
         {
             try

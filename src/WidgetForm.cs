@@ -43,10 +43,10 @@ namespace CoreGlance
         readonly Settings cfg;
         readonly SysMonitor mon;
         readonly Sensors sens;
-        readonly History hCpuT = new History(60), hGpuT = new History(60), hSysT = new History(60);
+        readonly History hCpuT = new History(60), hGpuT = new History(60), hSysT = new History(60), hCoreT = new History(60), hMidFan = new History(60);
         readonly History hCpuFan = new History(60), hGpuFan = new History(60), hCpuW = new History(60), hGpuW = new History(60), hBatW = new History(60);
         double maxFan = 5000, maxCpuW = 15, maxGpuW = 15;
-        ToolStripMenuItem miSensors, miCpuBusy, miCpuUtil;
+        ToolStripMenuItem miSensors, miPawn, miCpuBusy, miCpuUtil;
         readonly System.Windows.Forms.Timer timer;
         readonly NotifyIcon tray;
         ContextMenuStrip menu;
@@ -101,7 +101,9 @@ namespace CoreGlance
 
             mon = new SysMonitor();
             mon.UseUtility = cfg.CpuMetric == 1;
-            sens = new Sensors();
+            var physCores = new List<KeyValuePair<int, int>>();
+            foreach (LpInfo lp in mon.Lps) if (lp.Thread == 0) physCores.Add(new KeyValuePair<int, int>(lp.Group, lp.Number));
+            sens = new Sensors(physCores);
             BuildMenu();
             ContextMenuStrip = menu;
 
@@ -383,6 +385,8 @@ namespace CoreGlance
             hCpuT.Add(Hv(CpuTempBest()));
             hGpuT.Add(Hv(GpuTempBest()));
             hSysT.Add(Hv(sens.SysTemp));
+            hCoreT.Add(Hv(sens.CoreMaxTemp));
+            hMidFan.Add(Hv(sens.MidFan));
             hCpuFan.Add(Hv(sens.CpuFan));
             hGpuFan.Add(Hv(sens.GpuFan));
             hCpuW.Add(Hv(mon.CpuPkgW));
@@ -408,7 +412,7 @@ namespace CoreGlance
                 return;
             }
             if (MessageBox.Show(
-                "Fan speeds and CPU/GPU temperatures come from your laptop's firmware, which Windows only lets admin apps read.\n\n" +
+                "Fan speeds and exact CPU/GPU temperatures come from your laptop's firmware or the PawnIO driver, which Windows only lets admin apps read.\n\n" +
                 "CoreGlance will ask for admin once, copy itself to Program Files and add a scheduled task, so it starts with " +
                 "those rights from then on without asking again. It only reads sensors; it never changes fan or power settings.\n\nContinue?",
                 "Enable temperatures and fans", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) != DialogResult.OK) return;
@@ -420,6 +424,45 @@ namespace CoreGlance
             if (Settings.IsAutoStart()) Settings.SetAutoStart(true, Elevation.SecureExePath);
             cfg.Save();
             if (Elevation.RunTask()) { exiting = true; Close(); }
+        }
+
+        void InstallAdvancedSensors()
+        {
+            if (MessageBox.Show(
+                "Advanced CPU sensors read the exact CPU package and per-core temperatures on any Intel or AMD Ryzen laptop, " +
+                "and fan speeds on regular Dell laptops.\n\n" +
+                "This installs PawnIO, a small open-source, signed driver (the one LibreHardwareMonitor uses), from winget. " +
+                "Windows will ask for admin permission. CoreGlance only uses it to read sensors.\n\nContinue?",
+                "Advanced CPU sensors", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) != DialogResult.OK) return;
+            var worker = new System.Threading.Thread(delegate()
+            {
+                bool ok = Elevation.RunElevated("--install-pawnio") && PawnModule.Installed;
+                if (!IsHandleCreated) return;
+                BeginInvoke((MethodInvoker)delegate
+                {
+                    if (!ok)
+                    {
+                        MessageBox.Show("PawnIO could not be installed. You can install it from https://pawnio.eu, then restart CoreGlance.", "CoreGlance");
+                        return;
+                    }
+                    if (sens.Elevated)
+                    {
+                        MessageBox.Show("PawnIO is installed. Exit CoreGlance and open it again to start reading the new sensors.", "CoreGlance");
+                        return;
+                    }
+                    ToggleSensorMode();   // the driver is only reachable from admin mode
+                });
+            });
+            worker.IsBackground = true;
+            worker.Start();
+        }
+
+        string SensorHint()
+        {
+            if (!sens.Ready) return null;
+            if (sens.NeedsAdmin) return "More sensors need admin: right-click › Enable temps & fans";
+            if (!sens.PawnIoInstalled && double.IsNaN(sens.CpuTemp)) return "Exact CPU temp: right-click › Advanced CPU sensors";
+            return null;
         }
 
         void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e)
@@ -538,6 +581,7 @@ namespace CoreGlance
 
             miAuto = Item("Start with Windows", delegate { Settings.SetAutoStart(!Settings.IsAutoStart()); });
             miSensors = Item("Enable temperatures && fans (admin)...", delegate { ToggleSensorMode(); });
+            miPawn = Item("Advanced CPU sensors (install PawnIO)...", delegate { InstallAdvancedSensors(); });
 
             menu.Items.AddRange(new ToolStripItem[]
             {
@@ -547,6 +591,7 @@ namespace CoreGlance
                 new ToolStripSeparator(),
                 miAuto,
                 miSensors,
+                miPawn,
                 Item("Open Task Manager", delegate { try { Process.Start("taskmgr.exe"); } catch { } }),
                 Item("Reset position", delegate { cfg.X = cfg.Y = int.MinValue; PlaceDefault(); cfg.Save(); }),
                 Item("About CoreGlance", delegate { ShowAbout(); }),
@@ -570,7 +615,8 @@ namespace CoreGlance
             miClick.Checked = cfg.ClickThrough;
             miFull.Checked = cfg.HideFullscreen;
             miAuto.Checked = Settings.IsAutoStart();
-            miSensors.Visible = sens.AcerAvailable || sens.Elevated;
+            miSensors.Visible = sens.NeedsAdmin || sens.Elevated;
+            miPawn.Visible = sens.Ready && !sens.PawnIoInstalled;
             miSensors.Text = sens.Elevated ? "Admin sensor mode (on)" : "Enable temperatures && fans (admin)...";
             miSensors.Checked = sens.Elevated;
             foreach (ToolStripMenuItem it in opacityItems) it.Checked = Math.Abs((int)it.Tag - cfg.Opacity * 100) < 0.5;
@@ -583,6 +629,7 @@ namespace CoreGlance
                 "CoreGlance " + Program.Version + "\n\n" +
                 "Live CPU (per thread), memory, GPU, disk and network monitor.\n" +
                 "Data comes from Windows performance counters, the same source Task Manager uses.\n\n" +
+                "Sensor sources: " + sens.SourceList + (sens.Elevated ? " (admin mode)" : "") + "\n" +
                 "Settings: " + Settings.Dir,
                 "About CoreGlance", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
@@ -872,7 +919,7 @@ namespace CoreGlance
 
             y = CpuSection(g, x0, x1, y);
             List<Tile> tiles = BuildTiles();
-            if (tiles.Count > 0 || sens.AcerNeedsAdmin)
+            if (tiles.Count > 0 || SensorHint() != null)
             {
                 y = Separator(g, x0, x1, y);
                 y = SensorSection(g, tiles, x0, x1, y);
@@ -990,13 +1037,17 @@ namespace CoreGlance
         {
             var list = new List<Tile>();
             double ct = sens.CpuTemp;
+            string src = sens.CpuTempSource;
+            string cpuLabel = src == "CPU package" ? "CPU package" : src == "CPU Tctl" ? "CPU Tctl" : "CPU temp";
             if (!double.IsNaN(ct))
-                list.Add(new Tile("CPU temp", ct.ToString("0"), "°C", TempColor(ct), TempColor(ct), hCpuT, 100));
+                list.Add(new Tile(cpuLabel, ct.ToString("0"), "°C", TempColor(ct), TempColor(ct), hCpuT, 100));
             else if (!double.IsNaN(mon.AcpiTemp))
                 list.Add(new Tile("Thermal zone", mon.AcpiTemp.ToString("0"), "°C", TempColor(mon.AcpiTemp), TempColor(mon.AcpiTemp), hCpuT, 100));
             double gt = GpuTempBest();
             if (!double.IsNaN(gt))
                 list.Add(new Tile("GPU temp", gt.ToString("0"), "°C", TempColor(gt), TempColor(gt), hGpuT, 100));
+            if (!double.IsNaN(sens.CoreMaxTemp))
+                list.Add(new Tile("Hottest core", sens.CoreMaxTemp.ToString("0"), "°C", TempColor(sens.CoreMaxTemp), TempColor(sens.CoreMaxTemp), hCoreT, 100));
             if (!double.IsNaN(sens.SysTemp))
                 list.Add(new Tile("System temp", sens.SysTemp.ToString("0"), "°C", TempColor(sens.SysTemp), TempColor(sens.SysTemp), hSysT, 100));
             if (!double.IsNaN(sens.CpuFan))
@@ -1005,6 +1056,8 @@ namespace CoreGlance
                 list.Add(new Tile("GPU fan", sens.GpuFan.ToString("0"), "rpm", CFan, TextHi, hGpuFan, maxFan));
             else if (!double.IsNaN(sens.NvFanPct))
                 list.Add(new Tile("GPU fan", sens.NvFanPct.ToString("0"), "%", CFan, TextHi, null, 100));
+            if (!double.IsNaN(sens.MidFan))
+                list.Add(new Tile("Mid fan", sens.MidFan.ToString("0"), "rpm", CFan, TextHi, hMidFan, maxFan));
             if (!double.IsNaN(mon.CpuPkgW))
                 list.Add(new Tile("CPU power", mon.CpuPkgW.ToString("0.0"), "W", CPower, TextHi, hCpuW, maxCpuW));
             if (!double.IsNaN(sens.NvPowerW))
@@ -1055,10 +1108,11 @@ namespace CoreGlance
                 int rows = (tiles.Count + cols - 1) / cols;
                 y += rows * th + (rows - 1) * gap;
             }
-            if (sens.AcerNeedsAdmin)
+            string hint = SensorHint();
+            if (hint != null)
             {
                 y += 7 * S;
-                Txt(g, "Fans + CPU temp need admin: right-click › Enable temps & fans", fTiny, TextLo, x0, y, 0, cw);
+                Txt(g, hint, fTiny, TextLo, x0, y, 0, cw);
                 y += 13 * S;
             }
             return y;

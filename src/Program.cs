@@ -23,6 +23,7 @@ namespace CoreGlance
             bool fromTask = Has(args, "--from-task");
             if (Has(args, "--install-task")) return Elevation.InstallTask();
             if (Has(args, "--remove-task")) return Elevation.RemoveTask();
+            if (Has(args, "--install-pawnio")) return Elevation.InstallPawnIo();
             int snap = Array.FindIndex(args, delegate(string a) { return string.Equals(a, "--snapshot", StringComparison.OrdinalIgnoreCase); });
             if (snap >= 0 && snap + 1 < args.Length)
             {

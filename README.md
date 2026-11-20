@@ -39,24 +39,50 @@ It hides itself while a full-screen app or video is playing and comes back after
 
 ## Temperatures, fans and power
 
-| Reading | Source | Needs admin? |
-| --- | --- | --- |
-| Thermal zone temperature, throttling | Windows thermal-zone counters | No |
-| CPU package power (W) | Intel/AMD RAPL energy counters | No |
-| NVIDIA GPU temperature, power, clock | `nvml.dll` from the NVIDIA driver | No |
-| Battery charge/discharge rate, time left | Windows battery WMI | No |
-| CPU fan, GPU fan (RPM), CPU/GPU/system temperature | Acer firmware (`AcerGamingFunction`) | **Yes** |
+CoreGlance works on any Windows 10/11 laptop. It reads each sensor from the best source the machine
+has, and a tile only appears when a reading exists.
 
-To get fan speeds, right-click > **Enable temperatures & fans (admin)...**. It asks for UAC once, copies
-the exe to `C:\Program Files\CoreGlance` (where a normal-user program can't replace it) and registers
-a scheduled task named `CoreGlance`. From then on, the normal launcher starts the admin copy through
-that task, with no UAC prompt each time. CoreGlance only *reads* sensors and never changes fan or power settings.
+**Every laptop, no setup:**
+
+| Reading | Source |
+| --- | --- |
+| Thermal zone temperature, throttling | Windows thermal-zone counters |
+| CPU package power (W) | Intel/AMD RAPL energy counters |
+| NVIDIA GPU temperature, power, clock | `nvml.dll` from the NVIDIA driver |
+| Battery charge/discharge rate, time left | Windows battery WMI |
+
+**Laptop-maker firmware** (fan RPM plus CPU/GPU temperatures; most need admin sensor mode):
+
+| Brand | Interface | Based on |
+| --- | --- | --- |
+| Acer (Nitro, Predator, Aspire) | `AcerGamingFunction` WMI | Linux `acer-wmi` (tested on Aspire A515-58GM) |
+| ASUS (ROG, TUF, Zenbook, Vivobook) | `\\.\ATKACPI` driver | G-Helper |
+| Lenovo (Legion, LOQ, IdeaPad Gaming) | `LENOVO_OTHER_METHOD` / `LENOVO_FAN_METHOD` WMI | Lenovo Legion Toolkit |
+| HP (Omen, Victus) | `hpqBIntM` BIOS WMI | OmenMon |
+| Dell (Alienware, G-series) | `AWCCWmiMethodFunction` WMI | alienfx-tools |
+
+**Advanced CPU sensors** (optional, right-click > *Advanced CPU sensors*): this installs
+[PawnIO](https://pawnio.eu), the small signed open-source driver LibreHardwareMonitor uses, from winget. It adds:
+- exact CPU package temperature and hottest-core temperature on **any Intel** laptop (MSR);
+- CPU Tctl on **any AMD Ryzen** laptop (SMN);
+- fan RPM and CPU/GPU temperatures on **ordinary Dell** laptops (Inspiron, Latitude, Vostro, XPS) through Dell SMM.
+
+The official signed PawnIO modules (`IntelMSR`, `AMDFamily17`, `DellSMM`, LGPL-2.1, see
+`assets/pawnio/COPYING-LGPL-2.1.txt`) are embedded in the exe, so nothing else is downloaded.
+
+**Admin sensor mode:** firmware interfaces and the PawnIO driver only answer admin programs. Right-click >
+**Enable temperatures & fans (admin)...** asks for UAC once, copies the exe to `C:\Program Files\CoreGlance`
+(where a normal-user program can't replace it) and registers a scheduled task named `CoreGlance`. From then
+on, the normal launcher starts the admin copy through that task, with no UAC prompt each time.
+CoreGlance only *reads* sensors and never changes fan or power settings. *About CoreGlance* lists the
+sensor sources in use on your machine.
 
 NVIDIA readings appear only while the dGPU is already awake. CoreGlance never wakes a sleeping
 Optimus GPU, because that would drain the battery.
 
-Fan RPM on non-Acer laptops would need that vendor's firmware interface or a kernel driver
-(as NZXT CAM and LibreHardwareMonitor use). CoreGlance deliberately ships no driver.
+**Limits:** laptops outside these brands (for example most Samsung, MSI and ThinkPad models) have no
+standard fan-speed interface, so they show temperatures but no fan RPM. Only the Acer path is verified on
+real hardware; the other brands follow the open-source tools named above.
 
 ## Files
 
