@@ -43,6 +43,11 @@ namespace CoreGlance
         readonly Settings cfg;
         readonly SysMonitor mon;
         readonly Sensors sens;
+        readonly HealthMonitor health;
+        HealthWindow healthWin;
+        RectangleF btnHealth;
+        readonly bool healthSnapshot;
+        bool balloonIsHealth;
         readonly History hCpuT = new History(60), hGpuT = new History(60), hSysT = new History(60), hCoreT = new History(60), hMidFan = new History(60);
         readonly History hCpuFan = new History(60), hGpuFan = new History(60), hCpuW = new History(60), hGpuW = new History(60), hBatW = new History(60);
         double maxFan = 5000, maxCpuW = 15, maxGpuW = 15;
@@ -77,9 +82,12 @@ namespace CoreGlance
 
         public WidgetForm() : this(null) { }
 
-        public WidgetForm(string snapshot)
+        public WidgetForm(string snapshot) : this(snapshot, false) { }
+
+        public WidgetForm(string snapshot, bool healthReport)
         {
             snapshotPath = snapshot;
+            healthSnapshot = healthReport;
             cfg = Settings.Load();
             if (snapshotPath != null) { cfg.Visible = false; cfg.FirstRun = false; }
 
@@ -104,6 +112,7 @@ namespace CoreGlance
             var physCores = new List<KeyValuePair<int, int>>();
             foreach (LpInfo lp in mon.Lps) if (lp.Thread == 0) physCores.Add(new KeyValuePair<int, int>(lp.Group, lp.Number));
             sens = new Sensors(physCores);
+            health = new HealthMonitor(snapshotPath == null, sens.Elevated);
             BuildMenu();
             ContextMenuStrip = menu;
 
@@ -111,6 +120,7 @@ namespace CoreGlance
             tray.Text = "CoreGlance";
             tray.ContextMenuStrip = menu;
             tray.MouseClick += delegate(object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) ToggleVisible(); };
+            tray.BalloonTipClicked += delegate { if (balloonIsHealth) ShowHealth(); };
             UpdateTray();
             tray.Visible = snapshotPath == null;
 
@@ -262,6 +272,8 @@ namespace CoreGlance
                 tray.Dispose();
                 mon.Dispose();
                 sens.Dispose();
+                health.Dispose();
+                if (healthWin != null && !healthWin.IsDisposed) healthWin.Dispose();
                 DisposeFonts();
                 foreach (SolidBrush b in brushes.Values) b.Dispose();
                 brushes.Clear();
@@ -304,9 +316,11 @@ namespace CoreGlance
             catch (Exception ex) { Settings.Log("sample: " + ex); }
             sens.NvidiaActive = mon.NvidiaActive;
             RecordSensorHistory();
+            health.Tick(mon, sens, CpuTempBest());
+            if (snapshotPath == null && (DateTime.Now - health.Evaluated).TotalSeconds >= 30 && tick >= 10) EvaluateHealth();
 
             if (tick % 3 == 0) UpdateSelfUsage();
-            if (snapshotPath != null) { if (tick >= 8) TakeSnapshot(); return; }
+            if (snapshotPath != null) { if (tick >= (healthSnapshot ? 15 : 8)) TakeSnapshot(); return; }
             UpdateTray();
             CheckFullscreen();
             if (Visible) Invalidate();
@@ -334,8 +348,48 @@ namespace CoreGlance
             catch { }
         }
 
+        void EvaluateHealth()
+        {
+            try { health.Evaluate(mon, sens, CpuTempBest()); }
+            catch (Exception ex) { Settings.Log("health evaluate: " + ex); return; }
+            List<HealthFlag> alerts = health.TakeAlerts();
+            if (alerts.Count == 0) return;
+            HealthFlag top = alerts[0];
+            balloonIsHealth = true;
+            tray.ShowBalloonTip(8000, "PC health: " + top.Title,
+                top.Action + (alerts.Count > 1 ? string.Format("  (+{0} more: click to open the report)", alerts.Count - 1) : "  (click for the full report)"),
+                top.Level == Severity.Critical ? ToolTipIcon.Warning : ToolTipIcon.Info);
+        }
+
+        void ShowHealth()
+        {
+            if (healthWin == null || healthWin.IsDisposed)
+            {
+                try { health.Evaluate(mon, sens, CpuTempBest()); } catch (Exception ex) { Settings.Log("health evaluate: " + ex); }
+                healthWin = new HealthWindow(health, CpuTempBest, delegate { return (double)mon.CpuMhz; },
+                    delegate { return mon.OnAC || !mon.HasBattery; },
+                    delegate { health.Evaluate(mon, sens, CpuTempBest()); Invalidate(); });
+            }
+            if (healthWin.WindowState == FormWindowState.Minimized) healthWin.WindowState = FormWindowState.Normal;
+            healthWin.Show();
+            healthWin.Activate();
+        }
+
         void TakeSnapshot()
         {
+            if (healthSnapshot)
+            {
+                try
+                {
+                    health.Evaluate(mon, sens, CpuTempBest());
+                    HealthWindow.RenderSnapshot(health, snapshotPath, CpuTempBest(), mon.CpuMhz);
+                }
+                catch (Exception ex) { Settings.Log("health snapshot: " + ex); }
+                exiting = true;
+                Close();
+                return;
+            }
+            try { health.Evaluate(mon, sens, CpuTempBest()); } catch { }
             try
             {
                 for (int pass = 0; pass < 2; pass++)
@@ -586,6 +640,7 @@ namespace CoreGlance
             menu.Items.AddRange(new ToolStripItem[]
             {
                 miShow,
+                Item("PC health report...", delegate { ShowHealth(); }),
                 new ToolStripSeparator(),
                 view, cpuMetric, miTop, miLock, miClick, miFull, opacity, refresh,
                 new ToolStripSeparator(),
@@ -779,6 +834,7 @@ namespace CoreGlance
         {
             if (btnView.Contains(p)) return 1;
             if (btnMin.Contains(p)) return 2;
+            if (btnHealth.Contains(p)) return 3;
             return 0;
         }
 
@@ -819,7 +875,8 @@ namespace CoreGlance
             if (b != 0 && b == downBtn)
             {
                 downBtn = 0;
-                if (b == 2) MinimizeToTray();
+                if (b == 3) ShowHealth();
+                else if (b == 2) MinimizeToTray();
                 else SetView(cfg.View == 0 ? 1 : 0);
                 return;
             }
@@ -880,6 +937,7 @@ namespace CoreGlance
             tabCpu = RectangleF.Empty;
             tabMem = RectangleF.Empty;
             btnView = RectangleF.Empty;
+            btnHealth = RectangleF.Empty;
             btnMin = RectangleF.Empty;
 
             float h = cfg.View == 0 ? PaintCompact(g) : PaintFull(g, cfg.View == 2);
@@ -903,13 +961,20 @@ namespace CoreGlance
 
             // Header: name, battery, uptime
             Txt(g, "CoreGlance", fTitle, TextHi, x0, y, 0, 0);
+            {
+                float tw = Measure(g, "CoreGlance", fTitle);
+                string hs = health.Evaluated == DateTime.MinValue ? "Health ..." : "Health " + health.Score;
+                float pw = Measure(g, hs, fSmall) + 22 * S;
+                btnHealth = new RectangleF(x0 + tw + 8 * S, y - 1 * S, pw, 19 * S);
+                FillRound(g, B(hoverBtn == 3 ? Color.FromArgb(52, 57, 68) : PanelC), btnHealth, 9.5f * S);
+                g.FillEllipse(B(health.Evaluated == DateTime.MinValue ? TextLo : HealthPainter.ScoreColor(health.Score)), btnHealth.X + 8 * S, btnHealth.Y + 6.5f * S, 6 * S, 6 * S);
+                Txt(g, hs, fSmall, TextHi, btnHealth.X + 18 * S, btnHealth.Y + 3 * S, 0, 0);
+            }
             HeaderButtons(g, x1 + 5 * S, y - 3 * S, false);
             float hr = btnView.X - 8 * S;
-            string up = "up " + Uptime();
-            Txt(g, up, fSmall, TextLo, hr, y + 2 * S, 2, 0);
             if (mon.HasBattery && mon.BatteryPct >= 0)
             {
-                float hx = hr - Measure(g, up, fSmall) - 12 * S;
+                float hx = hr;
                 string bt = mon.BatteryPct + "%";
                 Txt(g, bt, fSmall, TextMid, hx, y + 2 * S, 2, 0);
                 hx -= Measure(g, bt, fSmall) + 5 * S;
@@ -1284,6 +1349,11 @@ namespace CoreGlance
                 info = string.Format("{0}  ·  {1}/{2} busy  ·  ↓ {3}", Ghz(mon.CpuMhz), mon.ActiveThreads, mon.Logical, Rate(mon.NetRx));
             Txt(g, info, fSmall, hoverCore >= 0 ? TextHi : TextMid, x0 + cw / 2, y, 1, cw);
             if (mouseInside) HeaderButtons(g, ClientSize.Width - 4 * S, 4 * S, true);
+            if (health.Evaluated != DateTime.MinValue)
+            {
+                btnHealth = new RectangleF(2 * S, 2 * S, 16 * S, 16 * S);
+                g.FillEllipse(B(hoverBtn == 3 ? TextHi : HealthPainter.ScoreColor(health.Score)), 6 * S, 6 * S, 7 * S, 7 * S);
+            }
             return y + 15 * S + 9 * S;
         }
 
@@ -1512,6 +1582,13 @@ namespace CoreGlance
                 s = topC != null
                     ? string.Format("Working: {0} leads at {1:0}% CPU", topC.Name, topC.Cpu)
                     : string.Format("Working: {0}/{1} threads busy", mon.ActiveThreads, mon.Logical);
+                return;
+            }
+            HealthFlag hf = health.Flags.Count > 0 ? health.Flags[0] : null;
+            if (hf != null && hf.Level >= Severity.Warn)
+            {
+                c = hf.Level == Severity.Critical ? Bad : Warn;
+                s = "Health: " + hf.Title;
                 return;
             }
             c = Good;

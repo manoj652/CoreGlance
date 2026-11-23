@@ -24,6 +24,26 @@ namespace CoreGlance
             if (Has(args, "--install-task")) return Elevation.InstallTask();
             if (Has(args, "--remove-task")) return Elevation.RemoveTask();
             if (Has(args, "--install-pawnio")) return Elevation.InstallPawnIo();
+            int bench = Array.FindIndex(args, delegate(string a) { return string.Equals(a, "--bench-test", StringComparison.OrdinalIgnoreCase); });
+            if (bench >= 0 && bench + 1 < args.Length)
+            {
+                // Diagnostic: a short render-speed check written to a text file.
+                var st = new StressTest();
+                var done = new ManualResetEvent(false);
+                st.Start(8, delegate { return double.NaN; }, delegate { return 0; }, delegate(StressTest t) { done.Set(); });
+                bool ok = done.WaitOne(30000);
+                System.IO.File.WriteAllText(args[bench + 1], string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                    "finished={0} score={1:0.0} threads={2}", ok, st.Score, Environment.ProcessorCount));
+                return ok ? 0 : 1;
+            }
+            int hsnap = Array.FindIndex(args, delegate(string a) { return string.Equals(a, "--health-snapshot", StringComparison.OrdinalIgnoreCase); });
+            if (hsnap >= 0 && hsnap + 1 < args.Length)
+            {
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+                Application.Run(new WidgetForm(args[hsnap + 1], true));
+                return 0;
+            }
             int snap = Array.FindIndex(args, delegate(string a) { return string.Equals(a, "--snapshot", StringComparison.OrdinalIgnoreCase); });
             if (snap >= 0 && snap + 1 < args.Length)
             {
