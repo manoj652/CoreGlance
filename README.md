@@ -35,11 +35,14 @@ Remove everything with `.\uninstall.ps1` (add `-KeepSettings` to keep your layou
 | Action | How |
 | --- | --- |
 | Move | Drag anywhere. It snaps to screen edges and remembers its position |
-| Minimize to tray | The **–** button (top right), or Ctrl+Alt+Shift+M from anywhere |
-| Bring back | Click the tray icon (it shows CPU and RAM bars), or Ctrl+Alt+Shift+M |
+| Open | Start Menu > CoreGlance, or its pinned icon. Opening it always shows the widget, even if it was hidden |
+| Pin to the taskbar | Right-click its taskbar icon > *Pin to taskbar* (right-click the widget > *Show in taskbar* turns the taskbar button off) |
+| Minimize | The **–** button (top right), the taskbar icon, or Ctrl+Alt+Shift+M from anywhere |
+| Hide to tray | Right-click > *Hide to tray*; click the tray icon (it shows CPU and RAM bars) to bring it back |
 | Compact or full view | The **▢** button, or double-click to cycle Compact, Standard, Detailed |
 | Thread detail | Hover a core bar: `CPU 5 · E-core 1 · 34% busy` |
-| Top processes | Detailed view; click **CPU** or **MEM** to sort |
+| GPU apps | The line under each GPU names the apps using it, or who holds its memory when idle (Standard and Detailed) |
+| Top processes | Detailed view; click **GPU**, **CPU** or **MEM**. GPU rows show which GPU, the app's busiest engine and its GPU memory |
 | PC health report | Click the **Health** badge next to the title (the dot in compact view), or right-click > *PC health report* |
 | Options | Right-click: always on top, lock position, click-through, opacity, refresh rate, hide over full-screen apps, start with Windows |
 
@@ -127,6 +130,7 @@ real hardware; the other brands follow the open-source tools named above.
 
 - `src/`: C# source (`SysMonitor` counters, `Sensors` firmware/WMI/NVML thread, `WidgetForm` UI)
 - `%APPDATA%\CoreGlance\settings.ini`: your settings; `error.log`: errors, if any
+- `src/Shell.cs` (opening the running copy, taskbar identity, Start Menu shortcut)
 - `src/Health.cs` (history, probes, flags, projections, render-speed check) and `src/HealthWindow.cs` (report)
 - `CoreGlance.exe --snapshot out.png`: renders the widget off-screen to a PNG (diagnostics)
 - `CoreGlance.exe --health-snapshot out.png`: renders the health report to a PNG

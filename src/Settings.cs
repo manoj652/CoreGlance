@@ -13,9 +13,9 @@ namespace CoreGlance
         public int X = int.MinValue, Y = int.MinValue;
         public int View = 1;          // 0 compact, 1 standard, 2 detailed
         public int Interval = 1000;   // ms
-        public int ProcSort = 0;      // 0 cpu, 1 memory
+        public int ProcSort = 0;      // 0 cpu, 1 memory, 2 gpu
         public int CpuMetric = 0;     // 0 busy time (like NZXT CAM), 1 utility (like Task Manager)
-        public bool TopMost = true, Locked, ClickThrough, Visible = true, HideFullscreen = true;
+        public bool TopMost = true, Locked, ClickThrough, Visible = true, HideFullscreen = true, InTaskbar = true;
         public double Opacity = 1.0;
         public bool FirstRun;
 
@@ -51,6 +51,7 @@ namespace CoreGlance
                         case "ClickThrough": s.ClickThrough = v == "1"; break;
                         case "Visible": s.Visible = v == "1"; break;
                         case "HideFullscreen": s.HideFullscreen = v == "1"; break;
+                        case "InTaskbar": s.InTaskbar = v == "1"; break;
                     }
                 }
             }
@@ -59,7 +60,7 @@ namespace CoreGlance
             if (s.View < 0 || s.View > 2) s.View = 1;
             if (s.Interval != 500 && s.Interval != 1000 && s.Interval != 2000 && s.Interval != 5000) s.Interval = 1000;
             if (s.Opacity < 0.4 || s.Opacity > 1) s.Opacity = 1.0;
-            if (s.ProcSort != 1) s.ProcSort = 0;
+            if (s.ProcSort < 0 || s.ProcSort > 2) s.ProcSort = 0;
             return s;
         }
 
@@ -75,7 +76,7 @@ namespace CoreGlance
                 sb.AppendLine("Opacity=" + Opacity.ToString("0.00", CultureInfo.InvariantCulture));
                 Line(sb, "TopMost", TopMost ? 1 : 0); Line(sb, "Locked", Locked ? 1 : 0);
                 Line(sb, "ClickThrough", ClickThrough ? 1 : 0); Line(sb, "Visible", Visible ? 1 : 0);
-                Line(sb, "HideFullscreen", HideFullscreen ? 1 : 0);
+                Line(sb, "HideFullscreen", HideFullscreen ? 1 : 0); Line(sb, "InTaskbar", InTaskbar ? 1 : 0);
                 string tmp = FilePath + ".tmp";
                 File.WriteAllText(tmp, sb.ToString(), Encoding.UTF8);
                 if (File.Exists(FilePath)) File.Replace(tmp, FilePath, null);
@@ -138,7 +139,7 @@ namespace CoreGlance
             {
                 using (RegistryKey k = Registry.CurrentUser.CreateSubKey(RunKey))
                 {
-                    if (on) k.SetValue(RunName, "\"" + exePath + "\"");
+                    if (on) k.SetValue(RunName, "\"" + exePath + "\" --autostart");
                     else k.DeleteValue(RunName, false);
                 }
             }

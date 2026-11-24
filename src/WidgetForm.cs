@@ -17,6 +17,7 @@ namespace CoreGlance
 
         const int WM_DPICHANGED = 0x02E0, WM_HOTKEY = 0x0312, WM_NCLBUTTONDOWN = 0x00A1, HTCAPTION = 2;
         const int WS_EX_TOOLWINDOW = 0x80, WS_EX_TRANSPARENT = 0x20, WS_EX_LAYERED = 0x80000, CS_DROPSHADOW = 0x20000;
+        const int WS_EX_APPWINDOW = 0x40000, WS_MINIMIZEBOX = 0x20000, WS_SYSMENU = 0x80000;
         const int HOTKEY_ID = 0xC61;
 
         // Palette
@@ -47,6 +48,8 @@ namespace CoreGlance
         HealthWindow healthWin;
         RectangleF btnHealth;
         readonly bool healthSnapshot;
+        System.Threading.RegisteredWaitHandle showWait;
+        ToolStripMenuItem miTaskbar;
         bool balloonIsHealth;
         readonly History hCpuT = new History(60), hGpuT = new History(60), hSysT = new History(60), hCoreT = new History(60), hMidFan = new History(60);
         readonly History hCpuFan = new History(60), hGpuFan = new History(60), hCpuW = new History(60), hGpuW = new History(60), hBatW = new History(60);
@@ -65,7 +68,7 @@ namespace CoreGlance
         readonly Dictionary<int, SolidBrush> brushes = new Dictionary<int, SolidBrush>();
 
         readonly List<RectangleF> coreRects = new List<RectangleF>();
-        RectangleF tabCpu, tabMem, btnView, btnMin;
+        RectangleF tabCpu, tabMem, tabGpu, btnView, btnMin;
         int hoverCore = -1, hoverBtn, downBtn;   // buttons: 1 view toggle, 2 minimize
         bool mouseInside, minTipShown;
         Point downPt;
@@ -89,11 +92,12 @@ namespace CoreGlance
             snapshotPath = snapshot;
             healthSnapshot = healthReport;
             cfg = Settings.Load();
-            if (snapshotPath != null) { cfg.Visible = false; cfg.FirstRun = false; }
+            if (snapshotPath != null) { cfg.Visible = false; cfg.FirstRun = false; cfg.InTaskbar = false; }
+            else if (Program.OpenedByUser) cfg.Visible = true;   // opening the app always shows it
 
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
             FormBorderStyle = FormBorderStyle.None;
-            ShowInTaskbar = false;
+            ShowInTaskbar = cfg.InTaskbar;
             StartPosition = FormStartPosition.Manual;
             AutoScaleMode = AutoScaleMode.None;
             MaximizeBox = false;
@@ -174,7 +178,12 @@ namespace CoreGlance
             get
             {
                 CreateParams cp = base.CreateParams;
-                cp.ExStyle |= WS_EX_TOOLWINDOW;      // no Alt+Tab / taskbar entry
+                if (cfg != null && cfg.InTaskbar)
+                {
+                    cp.ExStyle |= WS_EX_APPWINDOW;
+                    cp.Style |= WS_MINIMIZEBOX | WS_SYSMENU;   // lets the taskbar button minimize and restore it
+                }
+                else cp.ExStyle |= WS_EX_TOOLWINDOW;   // no Alt+Tab / taskbar entry
                 cp.ClassStyle |= CS_DROPSHADOW;
                 if (cfg != null && cfg.ClickThrough) cp.ExStyle |= WS_EX_TRANSPARENT | WS_EX_LAYERED;
                 return cp;
@@ -211,6 +220,12 @@ namespace CoreGlance
             catch { }
             // Let a normal-user second launch reach this window when it runs as admin.
             if (showMsg != 0) Native.ChangeWindowMessageFilterEx(Handle, showMsg, 1, IntPtr.Zero);
+            if (cfg.InTaskbar) TaskbarId.SetWindow(Handle);
+            if (showWait == null && snapshotPath == null && Program.ShowEvent != null)
+                showWait = System.Threading.ThreadPool.RegisterWaitForSingleObject(Program.ShowEvent, delegate
+                {
+                    try { BeginInvoke((MethodInvoker)ShowWidget); } catch { }   // handle may be mid-recreation or closing
+                }, null, -1, false);
             // Ctrl+Alt+Shift+M toggles the widget from anywhere.
             Native.RegisterHotKey(Handle, HOTKEY_ID, 0x0001 | 0x0002 | 0x0004 | 0x4000, (uint)Keys.M);
             KeepOnScreen();
@@ -266,6 +281,7 @@ namespace CoreGlance
                 SystemEvents.SessionSwitch -= OnSessionSwitch;
                 SystemEvents.PowerModeChanged -= OnPowerModeChanged;
                 SystemEvents.DisplaySettingsChanged -= OnDisplayChanged;
+                if (showWait != null) showWait.Unregister(null);
                 if (IsHandleCreated) Native.UnregisterHotKey(Handle, HOTKEY_ID);
                 timer.Dispose();
                 tray.Visible = false;
@@ -310,7 +326,7 @@ namespace CoreGlance
         {
             if (paused) return;
             tick++;
-            bool visible = Visible || snapshotPath != null;
+            bool visible = (Visible && !IsMinimized) || snapshotPath != null;
             bool wantProcs = visible && cfg.View != 0 && (cfg.View == 2 ? (tick % 2 == 0 || cfg.Interval >= 2000) : tick % 5 == 0);
             try { mon.Sample(wantProcs); }
             catch (Exception ex) { Settings.Log("sample: " + ex); }
@@ -421,7 +437,7 @@ namespace CoreGlance
             if (!cfg.HideFullscreen || !cfg.Visible) return;
             int state;
             bool fs = Native.SHQueryUserNotificationState(out state) == 0 && (state == 2 || state == 3 || state == 4);
-            if (fs && Visible) { autoHidden = true; Hide(); }
+            if (fs && Visible && !IsMinimized) { autoHidden = true; Hide(); }
             else if (!fs && autoHidden) { autoHidden = false; Show(); }
         }
 
@@ -589,7 +605,7 @@ namespace CoreGlance
         void BuildMenu()
         {
             menu = new ContextMenuStrip();
-            miShow = Item("Minimize to tray", delegate { if (Visible || autoHidden) MinimizeToTray(); else ShowWidget(); });
+            miShow = Item("Hide to tray", delegate { if ((Visible && !IsMinimized) || autoHidden) MinimizeToTray(); else ShowWidget(); });
             miShow.ShortcutKeyDisplayString = "Ctrl+Alt+Shift+M";
 
             var view = new ToolStripMenuItem("View");
@@ -603,6 +619,7 @@ namespace CoreGlance
             miCpuUtil = Item("Utility, scaled by clock (like Task Manager)", delegate { SetCpuMetric(1); });
             cpuMetric.DropDownItems.AddRange(new ToolStripItem[] { miCpuBusy, miCpuUtil });
 
+            miTaskbar = Item("Show in taskbar (pin it from there)", delegate { SetInTaskbar(!cfg.InTaskbar); });
             miTop = Item("Always on top", delegate { cfg.TopMost = !cfg.TopMost; TopMost = cfg.TopMost; cfg.Save(); });
             miLock = Item("Lock position", delegate { cfg.Locked = !cfg.Locked; cfg.Save(); });
             miClick = Item("Click-through", delegate { SetClickThrough(!cfg.ClickThrough); });
@@ -642,7 +659,7 @@ namespace CoreGlance
                 miShow,
                 Item("PC health report...", delegate { ShowHealth(); }),
                 new ToolStripSeparator(),
-                view, cpuMetric, miTop, miLock, miClick, miFull, opacity, refresh,
+                view, cpuMetric, miTaskbar, miTop, miLock, miClick, miFull, opacity, refresh,
                 new ToolStripSeparator(),
                 miAuto,
                 miSensors,
@@ -658,7 +675,8 @@ namespace CoreGlance
 
         void RefreshMenu()
         {
-            miShow.Text = Visible || autoHidden ? "Minimize to tray" : "Show widget";
+            miShow.Text = (Visible && !IsMinimized) || autoHidden ? "Hide to tray" : "Show widget";
+            miTaskbar.Checked = cfg.InTaskbar;
             miCompact.Checked = cfg.View == 0;
             miStandard.Checked = cfg.View == 1;
             miDetailed.Checked = cfg.View == 2;
@@ -692,6 +710,7 @@ namespace CoreGlance
         void SetView(int v)
         {
             if (v == cfg.View) return;
+            if (IsMinimized) WindowState = FormWindowState.Normal;
             Rectangle wa = Screen.FromRectangle(Bounds).WorkingArea;
             bool anchorRight = Left + Width / 2 > wa.Left + wa.Width / 2;
             int right = Right;
@@ -747,8 +766,31 @@ namespace CoreGlance
 
         void ToggleVisible()
         {
-            if (Visible || autoHidden) HideWidget();
-            else ShowWidget();
+            if (!((Visible && !IsMinimized) || autoHidden)) ShowWidget();
+            else if (cfg.InTaskbar && !autoHidden) WindowState = FormWindowState.Minimized;   // stays on the taskbar
+            else HideWidget();
+        }
+
+        bool IsMinimized { get { return WindowState == FormWindowState.Minimized; } }
+
+        /// <summary>The widget's minimize button: to the taskbar when it has a button there, otherwise to the tray.</summary>
+        void MinimizeWidget()
+        {
+            if (cfg.InTaskbar) WindowState = FormWindowState.Minimized;
+            else MinimizeToTray();
+        }
+
+        void SetInTaskbar(bool on)
+        {
+            if (IsMinimized) WindowState = FormWindowState.Normal;
+            Point at = Location;
+            cfg.InTaskbar = on;
+            ShowInTaskbar = on;      // recreates the window with the new styles
+            if (cfg.Visible && !Visible) Show();
+            Location = at;
+            KeepOnScreen();
+            cfg.Save();
+            Invalidate();
         }
 
         void MinimizeToTray()
@@ -775,8 +817,11 @@ namespace CoreGlance
             autoHidden = false;
             cfg.Visible = true;
             Show();
+            if (IsMinimized) WindowState = FormWindowState.Normal;
             KeepOnScreen();
             if (cfg.TopMost) { TopMost = false; TopMost = true; }
+            else BringToFront();
+            Activate();
             cfg.Save();
             Invalidate();
         }
@@ -791,6 +836,7 @@ namespace CoreGlance
 
         void KeepOnScreen()
         {
+            if (IsMinimized) return;   // minimized windows report an off-screen position
             Rectangle b = Bounds;
             bool onAny = false;
             foreach (Screen s in Screen.AllScreens)
@@ -823,8 +869,7 @@ namespace CoreGlance
 
         void SaveLocation()
         {
-            cfg.X = Left;
-            cfg.Y = Top;
+            if (!IsMinimized) { cfg.X = Left; cfg.Y = Top; }
             cfg.Save();
         }
 
@@ -862,7 +907,7 @@ namespace CoreGlance
             int h = -1;
             for (int i = 0; i < coreRects.Count; i++) if (coreRects[i].Contains(e.Location)) { h = i; break; }
             if (h != hoverCore) { hoverCore = h; Invalidate(); }
-            Cursor want = hb != 0 || tabCpu.Contains(e.Location) || tabMem.Contains(e.Location) ? Cursors.Hand : Cursors.Default;
+            Cursor want = hb != 0 || tabGpu.Contains(e.Location) || tabCpu.Contains(e.Location) || tabMem.Contains(e.Location) ? Cursors.Hand : Cursors.Default;
             if (Cursor != want) Cursor = want;
         }
 
@@ -876,19 +921,20 @@ namespace CoreGlance
             {
                 downBtn = 0;
                 if (b == 3) ShowHealth();
-                else if (b == 2) MinimizeToTray();
+                else if (b == 2) MinimizeWidget();
                 else SetView(cfg.View == 0 ? 1 : 0);
                 return;
             }
             downBtn = 0;
             if (tabCpu.Contains(e.Location)) SetSort(0);
             else if (tabMem.Contains(e.Location)) SetSort(1);
+            else if (tabGpu.Contains(e.Location)) SetSort(2);
         }
 
         protected override void OnMouseDoubleClick(MouseEventArgs e)
         {
             base.OnMouseDoubleClick(e);
-            if (e.Button == MouseButtons.Left && ButtonAt(e.Location) == 0 && !tabCpu.Contains(e.Location) && !tabMem.Contains(e.Location))
+            if (e.Button == MouseButtons.Left && ButtonAt(e.Location) == 0 && !tabGpu.Contains(e.Location) && !tabCpu.Contains(e.Location) && !tabMem.Contains(e.Location))
                 SetView((cfg.View + 1) % 3);
         }
 
@@ -936,6 +982,7 @@ namespace CoreGlance
             coreRects.Clear();
             tabCpu = RectangleF.Empty;
             tabMem = RectangleF.Empty;
+            tabGpu = RectangleF.Empty;
             btnView = RectangleF.Empty;
             btnHealth = RectangleF.Empty;
             btnMin = RectangleF.Empty;
@@ -949,6 +996,7 @@ namespace CoreGlance
                 BeginInvoke((MethodInvoker)delegate
                 {
                     resizePending = false;
+                    if (IsMinimized) return;
                     ClientSize = new Size(ScaledWidth(), need);
                     KeepOnScreen();
                 });
@@ -1251,7 +1299,25 @@ namespace CoreGlance
             Txt(g, Pct(gpu.Util), fMid, TextHi, x0 - 1 * S, y, 0, 0);
             Txt(g, gpu.Util >= 1 && gpu.Engine.Length > 0 ? gpu.Engine : "idle", fTiny, TextLo, x0, y + 22 * S, 0, 58 * S);
             Spark(g, gpu.Hist, new RectangleF(x0 + 64 * S, y + 1 * S, cw - 64 * S, 32 * S), CGpu);
-            return y + 34 * S;
+            y += 37 * S;
+            string apps = GpuApps(gpu);
+            Txt(g, apps, fTiny, TextMid, x0, y, 0, cw);
+            return y + 13 * S;
+        }
+
+        /// <summary>One line naming what is using this GPU: busy apps first, otherwise whoever holds its memory.</summary>
+        string GpuApps(Gpu gpu)
+        {
+            if (!mon.ProcReady) return "Reading GPU apps\u2026";
+            var parts = new List<string>();
+            foreach (GpuUse u in gpu.Procs)
+                if (u.Util >= 0.5 && parts.Count < 3) parts.Add(string.Format("{0} {1}", u.Name, CpuText(u.Util)));
+            if (parts.Count > 0) return string.Join("  \u00B7  ", parts.ToArray());
+            var holders = new List<GpuUse>(gpu.Procs);
+            holders.Sort(delegate(GpuUse p, GpuUse q) { return q.Mem.CompareTo(p.Mem); });
+            foreach (GpuUse u in holders)
+                if (u.Mem >= 10 * 1048576.0 && parts.Count < 2) parts.Add(u.Name + " " + Mb(u.Mem));
+            return parts.Count > 0 ? "Idle, memory held by " + string.Join("  \u00B7  ", parts.ToArray()) : "No apps using this GPU";
         }
 
         float IoSection(Graphics g, float x0, float x1, float y)
@@ -1281,11 +1347,24 @@ namespace CoreGlance
             tabCpu = new RectangleF(tx - 5 * S, y - 4 * S, wc + 10 * S, 20 * S);
             Txt(g, "CPU", fLabel, cfg.ProcSort == 0 ? CCpu : TextLo, tx, y, 0, 0);
             if (cfg.ProcSort == 0) g.FillRectangle(B(CCpu), tx, y + 14 * S, wc, 1.5f * S);
+            if (mon.Gpus.Count > 0)
+            {
+                float wg = Measure(g, "GPU", fLabel);
+                tx -= 14 * S + wg;
+                tabGpu = new RectangleF(tx - 5 * S, y - 4 * S, wg + 10 * S, 20 * S);
+                Txt(g, "GPU", fLabel, cfg.ProcSort == 2 ? CGpu : TextLo, tx, y, 0, 0);
+                if (cfg.ProcSort == 2) g.FillRectangle(B(CGpu), tx, y + 14 * S, wg, 1.5f * S);
+            }
             y += 21 * S;
 
             const int rows = 6;
             float rh = 19 * S;
-            List<ProcInfo> list = cfg.ProcSort == 0 ? mon.TopCpu : mon.TopMem;
+            if (cfg.ProcSort == 2 && mon.Gpus.Count > 0)
+            {
+                GpuRows(g, x0, x1, y, rows, rh);
+                return y + rows * rh;
+            }
+            List<ProcInfo> list = cfg.ProcSort == 1 ? mon.TopMem : mon.TopCpu;
             if (!mon.ProcReady || list.Count == 0)
             {
                 Txt(g, "Collecting process data…", fSmall, TextLo, x0, y + 3 * S, 0, cw);
@@ -1310,6 +1389,29 @@ namespace CoreGlance
                 }
             }
             return y + rows * rh;
+        }
+
+        /// <summary>Top apps by GPU use: name, which GPU, percent of its busiest engine, GPU memory.</summary>
+        void GpuRows(Graphics g, float x0, float x1, float y, int rows, float rh)
+        {
+            float cw = x1 - x0;
+            if (!mon.ProcReady || mon.TopGpu.Count == 0)
+            {
+                Txt(g, mon.ProcReady ? "No apps are using the GPU" : "Collecting process data\u2026", fSmall, TextLo, x0, y + 3 * S, 0, cw);
+                return;
+            }
+            double max = 10;
+            foreach (GpuUse u in mon.TopGpu) max = Math.Max(max, u.Util);
+            for (int k = 0; k < Math.Min(rows, mon.TopGpu.Count); k++)
+            {
+                GpuUse u = mon.TopGpu[k];
+                float ry = y + k * rh;
+                FillRound(g, B(Color.FromArgb(30, CGpu)), new RectangleF(x0, ry + 1 * S, Math.Max(3 * S, cw * (float)(u.Util / max)), rh - 3 * S), 3 * S);
+                Txt(g, u.Name + (u.Count > 1 ? "  \u00D7" + u.Count : ""), fSmall, TextHi, x0 + 6 * S, ry + 3.5f * S, 0, cw - 168 * S);
+                Txt(g, "GPU " + mon.Gpus.IndexOf(u.Gpu), fTiny, TextLo, x1 - 120 * S, ry + 4 * S, 2, 0);
+                Txt(g, CpuText(u.Util), fSmall, TextHi, x1 - 66 * S, ry + 3.5f * S, 2, 0);
+                Txt(g, Mb(u.Mem), fSmall, TextMid, x1 - 6 * S, ry + 3.5f * S, 2, 0);
+            }
         }
 
         float Footer(Graphics g, float x0, float x1, float y)

@@ -1,5 +1,7 @@
 using System;
 using System.Reflection;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Threading;
 using System.Windows.Forms;
 
@@ -7,15 +9,20 @@ using System.Windows.Forms;
 [assembly: AssemblyDescription("Lightweight live CPU, memory, GPU, temperature, fan, disk and network widget")]
 [assembly: AssemblyProduct("CoreGlance")]
 [assembly: AssemblyCopyright("Copyright 2026")]
-[assembly: AssemblyVersion("1.1.0.0")]
-[assembly: AssemblyFileVersion("1.1.0.0")]
+[assembly: AssemblyVersion("1.3.0.0")]
+[assembly: AssemblyFileVersion("1.3.0.0")]
 
 namespace CoreGlance
 {
     static class Program
     {
-        public const string Version = "1.1.0";
+        public const string Version = "1.3.0";
         const string MutexName = @"Local\CoreGlance.SingleInstance";
+
+        /// <summary>Signaled by a second launch; the widget shows itself.</summary>
+        public static EventWaitHandle ShowEvent;
+        /// <summary>The user opened the app (as opposed to Windows starting it at sign-in).</summary>
+        public static bool OpenedByUser;
 
         [STAThread]
         static int Main(string[] args)
@@ -24,6 +31,9 @@ namespace CoreGlance
             if (Has(args, "--install-task")) return Elevation.InstallTask();
             if (Has(args, "--remove-task")) return Elevation.RemoveTask();
             if (Has(args, "--install-pawnio")) return Elevation.InstallPawnIo();
+            if (Has(args, "--make-shortcut")) return TaskbarId.MakeShortcut();
+            if (Has(args, "--enable-autostart")) { Settings.SetAutoStart(true); return Settings.IsAutoStart() ? 0 : 1; }
+            bool autostart = Has(args, "--autostart");
             int bench = Array.FindIndex(args, delegate(string a) { return string.Equals(a, "--bench-test", StringComparison.OrdinalIgnoreCase); });
             if (bench >= 0 && bench + 1 < args.Length)
             {
@@ -58,8 +68,7 @@ namespace CoreGlance
             if (mutex == null)
             {
                 // Already running: ask the running copy to show itself, then quit.
-                uint msg = Native.RegisterWindowMessage(WidgetForm.ShowMessageName);
-                if (msg != 0) Native.PostMessage((IntPtr)0xFFFF, msg, IntPtr.Zero, IntPtr.Zero);
+                if (!autostart && !fromTask) ShowSignal.Send(5000);
                 return 0;
             }
 
@@ -68,10 +77,18 @@ namespace CoreGlance
             {
                 mutex.ReleaseMutex();
                 mutex.Dispose();
-                if (Elevation.RunTask()) return 0;
+                if (Elevation.RunTask())
+                {
+                    // Wait for the admin copy to come up; opening the app must always end with a visible window.
+                    if (autostart || ShowSignal.Send(12000)) return 0;
+                    Settings.Log("admin copy did not start; running without admin");
+                }
                 mutex = Acquire(0);
                 if (mutex == null) return 0;
             }
+            OpenedByUser = !autostart && !fromTask;
+            try { ShowEvent = ShowSignal.Create(); } catch (Exception ex) { Settings.Log("show signal: " + ex.Message); }
+            TaskbarId.SetProcess();
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
@@ -90,8 +107,14 @@ namespace CoreGlance
         static Mutex Acquire(int waitMs)
         {
             Mutex m;
-            try { m = new Mutex(false, MutexName); }
-            catch (UnauthorizedAccessException) { return null; }   // held by the admin copy
+            try
+            {
+                bool created;
+                var sec = new MutexSecurity();   // same user at either integrity level, so launcher and admin copy see each other
+                sec.AddAccessRule(new MutexAccessRule(WindowsIdentity.GetCurrent().User, MutexRights.FullControl, AccessControlType.Allow));
+                m = new Mutex(false, MutexName, out created, sec);
+            }
+            catch (UnauthorizedAccessException) { return null; }   // held by another copy
             try
             {
                 if (m.WaitOne(waitMs, false)) return m;

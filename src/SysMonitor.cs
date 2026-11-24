@@ -37,6 +37,16 @@ namespace CoreGlance
         public float Util;
         public string Engine = "";
         public readonly History Hist = new History(60);
+        public List<GpuUse> Procs = new List<GpuUse>();   // busiest apps on this GPU
+    }
+
+    /// <summary>One app's use of one GPU (all its processes added up).</summary>
+    sealed class GpuUse
+    {
+        public string Name, Engine = "";
+        public Gpu Gpu;
+        public int Count;
+        public double Util, Mem;
     }
 
     sealed class ProcInfo
@@ -153,6 +163,13 @@ namespace CoreGlance
         public bool ProcReady;
         int procCollects;
 
+        /// <summary>Busiest apps across all GPUs.</summary>
+        public List<GpuUse> TopGpu = new List<GpuUse>();
+        readonly List<KeyValuePair<string, double>> engInstances = new List<KeyValuePair<string, double>>();
+        Dictionary<int, string> pidNames = new Dictionary<int, string>();
+        double pidNamesT = -1000;
+        IntPtr pGpuLocal, pGpuNonLocal;
+
         readonly Dictionary<int, int> lpIndex = new Dictionary<int, int>();
         readonly Dictionary<string, double> engSum = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
         readonly Dictionary<string, string> engType = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -218,6 +235,9 @@ namespace CoreGlance
             pq = new Pdh();
             pCpu = pq.Add(@"\Process(*)\% Processor Time");
             pMem = pq.Add(@"\Process(*)\Working Set - Private");
+            // Resident memory. "Shared Usage" over-counts per process (gigabytes for dwm), these add up to the adapter totals.
+            pGpuLocal = pq.Add(@"\GPU Process Memory(*)\Local Usage");
+            pGpuNonLocal = pq.Add(@"\GPU Process Memory(*)\Non Local Usage");
             procCollects = 0;
             ProcReady = false;
         }
@@ -296,12 +316,13 @@ namespace CoreGlance
 
             // ---- GPU (Task Manager method: sum per engine across processes, busiest engine wins) ----
             foreach (Gpu g in Gpus) { g.Util = 0; g.Engine = ""; }
-            engSum.Clear(); engType.Clear();
+            engSum.Clear(); engType.Clear(); engInstances.Clear();
             q.Array(cEng, delegate(string n, double v)
             {
                 int li = n.IndexOf("luid_", StringComparison.OrdinalIgnoreCase);
                 int et = n.IndexOf("_engtype_", StringComparison.OrdinalIgnoreCase);
                 if (li < 0 || et < li) return;
+                if (wantProcs && v >= 0.05) engInstances.Add(new KeyValuePair<string, double>(n, v));
                 string key = n.Substring(li, et - li);
                 double cur; engSum.TryGetValue(key, out cur);
                 engSum[key] = cur + v;
@@ -358,7 +379,7 @@ namespace CoreGlance
                 Charging = (ps.BatteryFlag & 8) != 0;
             }
 
-            if (wantProcs) SampleProcesses();
+            if (wantProcs) { SampleProcesses(); SampleGpuProcesses(now); }
         }
 
         void SampleProcesses()
@@ -385,6 +406,101 @@ namespace CoreGlance
             list.Sort(delegate(ProcInfo a, ProcInfo b) { return b.Mem.CompareTo(a.Mem); });
             TopMem = list.GetRange(0, Math.Min(6, list.Count));
             ProcReady = procCollects >= 2;
+        }
+
+        static int PidOf(string instance)
+        {
+            if (!instance.StartsWith("pid_", StringComparison.OrdinalIgnoreCase)) return -1;
+            int end = instance.IndexOf('_', 4), pid;
+            return end > 4 && int.TryParse(instance.Substring(4, end - 4), out pid) ? pid : -1;
+        }
+
+        string NameOf(int pid, double now, ref bool refreshed)
+        {
+            string name;
+            if (pidNames.TryGetValue(pid, out name)) return name;
+            if (!refreshed)
+            {
+                refreshed = true;
+                RefreshPidNames(now);
+                if (pidNames.TryGetValue(pid, out name)) return name;
+            }
+            return null;   // the process has already exited
+        }
+
+        void RefreshPidNames(double now)
+        {
+            var map = new Dictionary<int, string>();
+            foreach (Process p in Process.GetProcesses())
+                using (p) { try { map[p.Id] = p.ProcessName; } catch { } }
+            pidNames = map;
+            pidNamesT = now;
+        }
+
+        sealed class GpuPid { public int Pid; public Gpu Gpu; public double Util, Mem; public string Engine = ""; }
+
+        /// <summary>Per-app GPU use, the way Task Manager counts it: a process's busiest engine on each GPU, plus its GPU memory.</summary>
+        void SampleGpuProcesses(double now)
+        {
+            var byPid = new Dictionary<string, GpuPid>(StringComparer.OrdinalIgnoreCase);
+            foreach (KeyValuePair<string, double> kv in engInstances)
+            {
+                GpuPid u = GpuPidFor(byPid, kv.Key);
+                if (u == null || kv.Value <= u.Util) continue;
+                u.Util = kv.Value;
+                int et = kv.Key.IndexOf("_engtype_", StringComparison.OrdinalIgnoreCase);
+                u.Engine = et > 0 ? PrettyEngine(kv.Key.Substring(et + 9)) : "";
+            }
+            Pdh.ItemHandler addMem = delegate(string n, double v)
+            {
+                if (v <= 0) return;
+                GpuPid u = GpuPidFor(byPid, n);
+                if (u != null) u.Mem += v;
+            };
+            pq.Array(pGpuLocal, addMem);
+            pq.Array(pGpuNonLocal, addMem);
+
+            bool refreshed = false;
+            if (now - pidNamesT > 60) { refreshed = true; RefreshPidNames(now); }   // process ids get reused
+            var byName = new Dictionary<string, GpuUse>(StringComparer.OrdinalIgnoreCase);
+            foreach (GpuPid u in byPid.Values)
+            {
+                string name = NameOf(u.Pid, now, ref refreshed);
+                if (name == null) continue;
+                string key = u.Gpu.Luid + "|" + name;
+                GpuUse g;
+                if (!byName.TryGetValue(key, out g)) { g = new GpuUse(); g.Name = name; g.Gpu = u.Gpu; byName[key] = g; }
+                if (g.Count == 0 || u.Util > 0 && g.Engine.Length == 0) g.Engine = u.Engine;
+                g.Count++;
+                g.Util = Math.Min(100, g.Util + u.Util);
+                g.Mem += u.Mem;
+            }
+            var all = new List<GpuUse>(byName.Values);
+            all.Sort(delegate(GpuUse a, GpuUse b)
+            {
+                // Rounded so idle apps order by memory instead of jittering on tiny percentages.
+                int c = Math.Round(b.Util, 1).CompareTo(Math.Round(a.Util, 1));
+                return c != 0 ? c : b.Mem.CompareTo(a.Mem);
+            });
+            foreach (Gpu g in Gpus)
+            {
+                var list = new List<GpuUse>();
+                foreach (GpuUse u in all) if (u.Gpu == g && list.Count < 10) list.Add(u);
+                g.Procs = list;
+            }
+            TopGpu = all.GetRange(0, Math.Min(6, all.Count));
+        }
+
+        GpuPid GpuPidFor(Dictionary<string, GpuPid> map, string instance)
+        {
+            int pid = PidOf(instance);
+            if (pid < 0) return null;
+            Gpu g = GpuFor(instance, false);
+            if (g == null) return null;
+            string key = pid + "|" + g.Luid;
+            GpuPid u;
+            if (!map.TryGetValue(key, out u)) { u = new GpuPid(); u.Pid = pid; u.Gpu = g; map[key] = u; }
+            return u;
         }
 
         static ProcInfo ProcFor(Dictionary<string, ProcInfo> map, string n)

@@ -18,17 +18,12 @@ Start-Sleep -Milliseconds 500
 New-Item -ItemType Directory -Force $dest | Out-Null
 Copy-Item $src $exe -Force
 
-$lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'CoreGlance.lnk'
-$shell = New-Object -ComObject WScript.Shell
-$s = $shell.CreateShortcut($lnk)
-$s.TargetPath = $exe
-$s.WorkingDirectory = $dest
-$s.Description = 'Live CPU, memory, GPU, temperature and fan widget'
-$s.Save()
+# Start Menu shortcut with the app id, so a pinned icon and the running window are one app.
+Start-Process $exe -ArgumentList '--make-shortcut' -Wait
 
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 if ($NoAutostart) { Remove-ItemProperty $runKey -Name CoreGlance -ErrorAction SilentlyContinue }
-else { Set-ItemProperty $runKey -Name CoreGlance -Value "`"$exe`"" }
+else { Set-ItemProperty $runKey -Name CoreGlance -Value "`"$exe`" --autostart" }
 
 # Sensor mode: on request, or refresh the admin copy if it was enabled before.
 cmd.exe /c "schtasks.exe /Query /TN CoreGlance >nul 2>&1"
