@@ -51,8 +51,16 @@ It hides itself while a full-screen app or video is playing and comes back after
 
 ## Low power mode
 
-Click the **battery** in the widget header (or right-click > *Low power mode*) to make the battery last
-longer. CoreGlance switches to a copy of your own power plan with the CPU tuned for efficiency, and switches
+The **Power mode** row at the top of the widget has three buttons, **Off | Saver | Max**, each showing how
+long the battery would last in that mode at what you are doing right now. Clicking the battery in the header
+cycles through the same three modes (right-click > *Low power mode* has them too).
+
+Battery time comes from the battery's real drain while you are unplugged. When plugged in, it estimates the
+drain from the CPU's measured power plus the rest of the laptop. CoreGlance learns that "rest" (screen,
+SSD, Wi-Fi) each time you run on battery; until then it assumes 4.5 W. It leaves 5% in reserve, where
+Windows shuts down. The other modes are scaled by the savings measured below.
+
+Low power mode makes the battery last longer. CoreGlance switches to a copy of your own power plan with the CPU tuned for efficiency, and switches
 back when you turn it off. The copy is then deleted, and nothing else on your plan changes.
 
 | Level | What it does |

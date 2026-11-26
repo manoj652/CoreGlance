@@ -70,6 +70,9 @@ namespace CoreGlance
 
         readonly List<RectangleF> coreRects = new List<RectangleF>();
         RectangleF tabCpu, tabMem, tabGpu, btnView, btnMin, btnPower;
+        readonly RectangleF[] modeRects = new RectangleF[3];
+        double drawW = double.NaN, cpuW = double.NaN;     // smoothed battery drain and CPU package power
+        DateTime lastEnergy = DateTime.MinValue, platformSaved = DateTime.MinValue;
         int hoverCore = -1, hoverBtn, downBtn;   // buttons: 1 view toggle, 2 minimize
         bool mouseInside, minTipShown;
         Point downPt;
@@ -343,11 +346,12 @@ namespace CoreGlance
             catch (Exception ex) { Settings.Log("sample: " + ex); }
             sens.NvidiaActive = mon.NvidiaActive;
             RecordSensorHistory();
+            UpdateEnergyModel();
             health.Tick(mon, sens, CpuTempBest());
             if (snapshotPath == null && (DateTime.Now - health.Evaluated).TotalSeconds >= 30 && tick >= 10) EvaluateHealth();
 
             if (tick % 3 == 0) UpdateSelfUsage();
-            if (snapshotPath != null) { if (tick >= (healthSnapshot ? 15 : 8)) TakeSnapshot(); return; }
+            if (snapshotPath != null) { if (tick >= SnapshotTicks()) TakeSnapshot(); return; }
             UpdateTray();
             CheckAutoLowPower();
             CheckFullscreen();
@@ -747,6 +751,119 @@ namespace CoreGlance
             Invalidate();
         }
 
+        // ============================== battery time and power modes ==============================
+
+        int CurrentMode { get { return cfg.LowPower ? cfg.LowPowerLevel + 1 : 0; } }
+        static readonly string[] ModeNames = { "Off", "Saver", "Max" };
+
+        void SetMode(int m)
+        {
+            if (m == 0) SetLowPower(false, cfg.LowPowerLevel, false);
+            else SetLowPower(true, m - 1, false);
+        }
+
+        static double Ema(double old, double sample, double dt, double tau)
+        {
+            if (double.IsNaN(sample)) return old;
+            if (double.IsNaN(old)) return sample;
+            return old + (1 - Math.Exp(-dt / tau)) * (sample - old);
+        }
+
+        /// <summary>Smooths the battery drain and CPU power, and learns what the rest of the laptop draws while it runs on battery.</summary>
+        void UpdateEnergyModel()
+        {
+            DateTime now = DateTime.Now;
+            double dt = lastEnergy == DateTime.MinValue ? 1 : Math.Min(10, (now - lastEnergy).TotalSeconds);
+            lastEnergy = now;
+            double pkg = mon.CpuPkgW;
+            if (tick <= 5) return;   // CoreGlance's own start-up burst is not your normal use
+            if (!double.IsNaN(pkg) && pkg > 0) cpuW = Ema(cpuW, pkg, dt, 60);
+            bool discharging = mon.HasBattery && !mon.OnAC && !double.IsNaN(sens.BatRateW) && sens.BatRateW < -0.3;
+            if (!discharging) { drawW = double.NaN; return; }
+            drawW = Ema(drawW, -sens.BatRateW, dt, 45);
+            if (!double.IsNaN(cpuW))
+            {
+                double rest = -sens.BatRateW - cpuW - (double.IsNaN(sens.NvPowerW) ? 0 : sens.NvPowerW);
+                if (rest > 0.5 && rest < 40) cfg.PlatformW = Ema(cfg.PlatformW, rest, dt, 600);
+                if ((now - platformSaved).TotalMinutes >= 5) { platformSaved = now; cfg.Save(); }
+            }
+        }
+
+        /// <summary>How much less CPU power each mode draws than Off. Measured on this laptop: light use 0.6 / 0.5, full load 0.27 / 0.22.</summary>
+        static double ModeFactor(int mode, double offCpuW)
+        {
+            if (mode == 0) return 1;
+            double heavy = Math.Max(0, Math.Min(1, (offCpuW - 10) / 20));
+            return mode == 1 ? 0.6 + (0.27 - 0.6) * heavy : 0.5 + (0.22 - 0.5) * heavy;
+        }
+
+        /// <summary>Battery hours in a mode at the current activity, or NaN when there is no battery reading.</summary>
+        double HoursIn(int mode)
+        {
+            if (!mon.HasBattery || double.IsNaN(sens.BatRemainWh) || double.IsNaN(cpuW)) return double.NaN;
+            double full = double.IsNaN(sens.BatFullWh) ? sens.BatRemainWh : sens.BatFullWh;
+            double usable = Math.Max(0, sens.BatRemainWh - 0.05 * full);   // Windows shuts down around 5%
+            int cur = CurrentMode;
+            double offCpu = cpuW / ModeFactor(cur, cpuW / ModeFactor(cur, cpuW));
+            double gpu = double.IsNaN(sens.NvPowerW) ? 0 : sens.NvPowerW;
+            double platform = !double.IsNaN(drawW) ? Math.Max(0.5, drawW - cpuW - gpu) : double.IsNaN(cfg.PlatformW) ? 4.5 : cfg.PlatformW;
+            double watts = mode == cur && !double.IsNaN(drawW) ? drawW : platform + gpu + Math.Max(2, offCpu * ModeFactor(mode, offCpu));
+            return watts > 0.5 ? usable / watts : double.NaN;
+        }
+
+        static string HoursText(double h)
+        {
+            if (double.IsNaN(h) || double.IsInfinity(h)) return "-";
+            int m = (int)Math.Round(Math.Min(h, 99) * 60);
+            return m >= 60 ? string.Format("{0}h {1:00}m", m / 60, m % 60) : m + "m";
+        }
+
+        /// <summary>Off | Saver | Max, each with its battery time. Returns the y below it.</summary>
+        float ModeButtons(Graphics g, float x0, float x1, float y, float h, bool times)
+        {
+            float gap = 4 * S, w = (x1 - x0 - 2 * gap) / 3;
+            int cur = CurrentMode;
+            for (int i = 0; i < 3; i++)
+            {
+                var r = new RectangleF(x0 + i * (w + gap), y, w, h);
+                modeRects[i] = r;
+                bool sel = i == cur, hot = hoverBtn == 10 + i;
+                Color accent = i == 0 ? TextMid : Good;
+                FillRound(g, B(sel ? Color.FromArgb(i == 0 ? 60 : 55, accent) : hot ? Color.FromArgb(44, 49, 60) : PanelC), r, 6 * S);
+                if (sel)
+                    using (var pen = new Pen(Color.FromArgb(150, accent), Math.Max(1f, S)))
+                    using (GraphicsPath p = RoundRect(r, 6 * S)) g.DrawPath(pen, p);
+                string label = lowBusy && sel ? "\u2026" : ModeNames[i];
+                if (times)
+                {
+                    Txt(g, label, fSmall, sel ? TextHi : TextMid, r.X + r.Width / 2, r.Y + 4 * S, 1, w);
+                    Txt(g, mon.HasBattery ? "\u2248 " + HoursText(HoursIn(i)) : "", fTiny, sel ? (i == 0 ? TextHi : Good) : TextLo, r.X + r.Width / 2, r.Y + 19 * S, 1, w);
+                }
+                else Txt(g, label, fSmall, sel ? TextHi : TextMid, r.X + r.Width / 2, r.Y + (h - 14 * S) / 2, 1, w);
+            }
+            return y + h;
+        }
+
+        float PowerModeRow(Graphics g, float x0, float x1, float y)
+        {
+            Txt(g, "POWER MODE", fLabel, Good, x0, y, 0, 0);
+            string status;
+            if (!mon.HasBattery) status = "No battery";
+            else if (!double.IsNaN(drawW)) status = string.Format("{0} left  \u00B7  {1:0.0} W", HoursText(HoursIn(CurrentMode)), drawW);
+            else if (!double.IsNaN(sens.BatRemainWh)) status = "Plugged in  \u00B7  on battery \u2248 " + HoursText(HoursIn(CurrentMode));
+            else status = "Reading battery\u2026";
+            Txt(g, status, fSmall, !double.IsNaN(drawW) ? TextHi : TextLo, x1, y - 0.5f * S, 2, x1 - x0 - 80 * S);
+            y += 17 * S;
+            return ModeButtons(g, x0, x1, y, 34 * S, true);
+        }
+
+        int SnapshotTicks()
+        {
+            string[] a = Environment.GetCommandLineArgs();
+            int i = Array.IndexOf(a, "--ticks"), n;
+            return i >= 0 && i + 1 < a.Length && int.TryParse(a[i + 1], out n) ? n : healthSnapshot ? 15 : 8;
+        }
+
         int EffectiveInterval() { return cfg.LowPower ? Math.Max(2000, cfg.Interval) : cfg.Interval; }   // the widget itself also saves power
 
         /// <summary>Switches the power plan on a worker thread (powercfg takes about a second) and updates the widget.</summary>
@@ -959,6 +1076,7 @@ namespace CoreGlance
             if (btnMin.Contains(p)) return 2;
             if (btnHealth.Contains(p)) return 3;
             if (btnPower.Contains(p)) return 4;
+            for (int i = 0; i < 3; i++) if (modeRects[i].Contains(p)) return 10 + i;
             return 0;
         }
 
@@ -999,7 +1117,8 @@ namespace CoreGlance
             if (b != 0 && b == downBtn)
             {
                 downBtn = 0;
-                if (b == 4) SetLowPower(!cfg.LowPower, cfg.LowPowerLevel, false);
+                if (b >= 10) SetMode(b - 10);
+                else if (b == 4) SetMode((CurrentMode + 1) % 3);   // the battery cycles Off, Saver, Max
                 else if (b == 3) ShowHealth();
                 else if (b == 2) MinimizeWidget();
                 else SetView(cfg.View == 0 ? 1 : 0);
@@ -1066,6 +1185,7 @@ namespace CoreGlance
             btnView = RectangleF.Empty;
             btnHealth = RectangleF.Empty;
             btnPower = RectangleF.Empty;
+            for (int i = 0; i < 3; i++) modeRects[i] = RectangleF.Empty;
             btnMin = RectangleF.Empty;
 
             float h = cfg.View == 0 ? PaintCompact(g) : PaintFull(g, cfg.View == 2);
@@ -1115,6 +1235,8 @@ namespace CoreGlance
             }
             y += 26 * S;
 
+            y = PowerModeRow(g, x0, x1, y);
+            y = Separator(g, x0, x1, y);
             y = CpuSection(g, x0, x1, y);
             List<Tile> tiles = BuildTiles();
             if (tiles.Count > 0 || SensorHint() != null)
@@ -1526,9 +1648,11 @@ namespace CoreGlance
             Ring(g, x0 + 2 * (d + sp), y, d, gpu, CGpu, "GPU");
             y += d + 8 * S;
             y = CoreBars(g, x0, cw, y, 18 * S, false);
+            y = ModeButtons(g, x0, x1, y, 22 * S, false) + 7 * S;
             double ct = CpuTempBest();
             string info;
             if (hoverCore >= 0) info = CoreDetail(hoverCore);
+            else if (!double.IsNaN(drawW)) info = string.Format("{0} left  \u00B7  {1:0.0} W  \u00B7  {2}", HoursText(HoursIn(CurrentMode)), drawW, Ghz(mon.CpuMhz));
             else if (!double.IsNaN(ct) && !double.IsNaN(sens.CpuFan))
                 info = string.Format("{0}  ·  {1:0}°C  ·  fan {2:0} rpm", Ghz(mon.CpuMhz), ct, sens.CpuFan);
             else if (!double.IsNaN(ct))

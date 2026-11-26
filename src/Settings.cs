@@ -19,6 +19,7 @@ namespace CoreGlance
         public bool LowPower, LowPowerAuto, LowPowerByAuto;
         public int LowPowerLevel = 0;          // 0 battery saver, 1 max saver
         public string LowPowerPrev = "";       // power plan to go back to
+        public double PlatformW = double.NaN;  // learned on battery: screen, chipset, SSD, Wi-Fi (everything but CPU and dGPU)
         public double Opacity = 1.0;
         public bool FirstRun;
 
@@ -60,6 +61,7 @@ namespace CoreGlance
                         case "LowPowerByAuto": s.LowPowerByAuto = v == "1"; break;
                         case "LowPowerLevel": s.LowPowerLevel = Int(v, 0) == 1 ? 1 : 0; break;
                         case "LowPowerPrev": s.LowPowerPrev = v; break;
+                        case "PlatformW": s.PlatformW = Dbl(v, double.NaN); break;
                     }
                 }
             }
@@ -87,6 +89,7 @@ namespace CoreGlance
                 Line(sb, "HideFullscreen", HideFullscreen ? 1 : 0); Line(sb, "InTaskbar", InTaskbar ? 1 : 0);
                 Line(sb, "LowPower", LowPower ? 1 : 0); Line(sb, "LowPowerAuto", LowPowerAuto ? 1 : 0); Line(sb, "LowPowerByAuto", LowPowerByAuto ? 1 : 0);
                 Line(sb, "LowPowerLevel", LowPowerLevel); sb.Append("LowPowerPrev=").AppendLine(LowPowerPrev);
+                if (!double.IsNaN(PlatformW)) sb.AppendLine("PlatformW=" + PlatformW.ToString("0.00", CultureInfo.InvariantCulture));
                 string tmp = FilePath + ".tmp";
                 File.WriteAllText(tmp, sb.ToString(), Encoding.UTF8);
                 if (File.Exists(FilePath)) File.Replace(tmp, FilePath, null);
