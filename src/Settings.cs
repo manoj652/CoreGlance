@@ -16,6 +16,9 @@ namespace CoreGlance
         public int ProcSort = 0;      // 0 cpu, 1 memory, 2 gpu
         public int CpuMetric = 0;     // 0 busy time (like NZXT CAM), 1 utility (like Task Manager)
         public bool TopMost = true, Locked, ClickThrough, Visible = true, HideFullscreen = true, InTaskbar = true;
+        public bool LowPower, LowPowerAuto, LowPowerByAuto;
+        public int LowPowerLevel = 0;          // 0 battery saver, 1 max saver
+        public string LowPowerPrev = "";       // power plan to go back to
         public double Opacity = 1.0;
         public bool FirstRun;
 
@@ -52,6 +55,11 @@ namespace CoreGlance
                         case "Visible": s.Visible = v == "1"; break;
                         case "HideFullscreen": s.HideFullscreen = v == "1"; break;
                         case "InTaskbar": s.InTaskbar = v == "1"; break;
+                        case "LowPower": s.LowPower = v == "1"; break;
+                        case "LowPowerAuto": s.LowPowerAuto = v == "1"; break;
+                        case "LowPowerByAuto": s.LowPowerByAuto = v == "1"; break;
+                        case "LowPowerLevel": s.LowPowerLevel = Int(v, 0) == 1 ? 1 : 0; break;
+                        case "LowPowerPrev": s.LowPowerPrev = v; break;
                     }
                 }
             }
@@ -77,6 +85,8 @@ namespace CoreGlance
                 Line(sb, "TopMost", TopMost ? 1 : 0); Line(sb, "Locked", Locked ? 1 : 0);
                 Line(sb, "ClickThrough", ClickThrough ? 1 : 0); Line(sb, "Visible", Visible ? 1 : 0);
                 Line(sb, "HideFullscreen", HideFullscreen ? 1 : 0); Line(sb, "InTaskbar", InTaskbar ? 1 : 0);
+                Line(sb, "LowPower", LowPower ? 1 : 0); Line(sb, "LowPowerAuto", LowPowerAuto ? 1 : 0); Line(sb, "LowPowerByAuto", LowPowerByAuto ? 1 : 0);
+                Line(sb, "LowPowerLevel", LowPowerLevel); sb.Append("LowPowerPrev=").AppendLine(LowPowerPrev);
                 string tmp = FilePath + ".tmp";
                 File.WriteAllText(tmp, sb.ToString(), Encoding.UTF8);
                 if (File.Exists(FilePath)) File.Replace(tmp, FilePath, null);

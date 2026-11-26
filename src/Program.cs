@@ -34,6 +34,13 @@ namespace CoreGlance
             if (Has(args, "--make-shortcut")) return TaskbarId.MakeShortcut();
             if (Has(args, "--enable-autostart")) { Settings.SetAutoStart(true); return Settings.IsAutoStart() ? 0 : 1; }
             bool autostart = Has(args, "--autostart");
+            int lpt = Array.FindIndex(args, delegate(string a) { return string.Equals(a, "--low-power-test", StringComparison.OrdinalIgnoreCase); });
+            if (lpt >= 0 && lpt + 1 < args.Length)
+            {
+                string report = LowPower.SelfTest();
+                System.IO.File.WriteAllText(args[lpt + 1], report);
+                return report.Contains("ALL PASSED") ? 0 : 1;
+            }
             int bench = Array.FindIndex(args, delegate(string a) { return string.Equals(a, "--bench-test", StringComparison.OrdinalIgnoreCase); });
             if (bench >= 0 && bench + 1 < args.Length)
             {

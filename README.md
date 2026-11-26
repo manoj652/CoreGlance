@@ -49,6 +49,32 @@ Remove everything with `.\uninstall.ps1` (add `-KeepSettings` to keep your layou
 It hides itself while a full-screen app or video is playing and comes back afterwards
 (turn this off under right-click > *Hide over full-screen apps*). Sampling pauses while the PC is locked.
 
+## Low power mode
+
+Click the **battery** in the widget header (or right-click > *Low power mode*) to make the battery last
+longer. CoreGlance switches to a copy of your own power plan with the CPU tuned for efficiency, and switches
+back when you turn it off. The copy is then deleted, and nothing else on your plan changes.
+
+| Level | What it does |
+| --- | --- |
+| **Battery saver** | CPU capped at 2.0 GHz (E-cores 1.6 GHz), Windows' efficiency preference raised to 80, Windows Energy Saver always on while on battery |
+| **Max saver** | Capped at 1.6 GHz (E-cores 1.3 GHz), efficiency preference 90, and work goes to the efficient E-cores first |
+
+*Turn on automatically on battery* switches it on when you unplug and off when you plug back in.
+While it is on, the widget refreshes every 2 seconds at most, so it uses less power itself.
+
+Measured on the i5-1335U at full load, CPU package power (RAPL):
+
+| Plan | CPU power | Speed | Work per watt |
+| --- | --- | --- | --- |
+| Acer default | 31-35 W | 100% | 71-87 |
+| Battery saver | 8.2 W | 36% | 116 |
+| Max saver settings | 7.0 W | 25% | 95 |
+
+At light use the CPU drew 6-9 W instead of 10-22 W. Heavy work (renders, exports, games) runs much slower
+in low power mode, so turn it off for those. Not used: core parking, which made the laptop about 6× slower
+again for little extra saving.
+
 ## PC health: flags before hardware fails
 
 CoreGlance keeps a small daily history and turns it into a health score (0-100), **flags** with a

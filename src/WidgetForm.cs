@@ -54,7 +54,8 @@ namespace CoreGlance
         readonly History hCpuT = new History(60), hGpuT = new History(60), hSysT = new History(60), hCoreT = new History(60), hMidFan = new History(60);
         readonly History hCpuFan = new History(60), hGpuFan = new History(60), hCpuW = new History(60), hGpuW = new History(60), hBatW = new History(60);
         double maxFan = 5000, maxCpuW = 15, maxGpuW = 15;
-        ToolStripMenuItem miSensors, miPawn, miCpuBusy, miCpuUtil;
+        ToolStripMenuItem miSensors, miPawn, miCpuBusy, miCpuUtil, miLowOff, miLowSaver, miLowMax, miLowAuto;
+        bool lowBusy, lastOnAC = true;
         readonly System.Windows.Forms.Timer timer;
         readonly NotifyIcon tray;
         ContextMenuStrip menu;
@@ -68,7 +69,7 @@ namespace CoreGlance
         readonly Dictionary<int, SolidBrush> brushes = new Dictionary<int, SolidBrush>();
 
         readonly List<RectangleF> coreRects = new List<RectangleF>();
-        RectangleF tabCpu, tabMem, tabGpu, btnView, btnMin;
+        RectangleF tabCpu, tabMem, tabGpu, btnView, btnMin, btnPower;
         int hoverCore = -1, hoverBtn, downBtn;   // buttons: 1 view toggle, 2 minimize
         bool mouseInside, minTipShown;
         Point downPt;
@@ -92,7 +93,11 @@ namespace CoreGlance
             snapshotPath = snapshot;
             healthSnapshot = healthReport;
             cfg = Settings.Load();
-            if (snapshotPath != null) { cfg.Visible = false; cfg.FirstRun = false; cfg.InTaskbar = false; }
+            if (snapshotPath != null)
+            {
+                cfg.Visible = false; cfg.FirstRun = false; cfg.InTaskbar = false;
+                if (Array.IndexOf(Environment.GetCommandLineArgs(), "--as-low-power") >= 0) cfg.LowPower = true;   // render only; changes nothing
+            }
             else if (Program.OpenedByUser) cfg.Visible = true;   // opening the app always shows it
 
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
@@ -149,7 +154,13 @@ namespace CoreGlance
             ApplyOpacity();
 
             timer = new System.Windows.Forms.Timer();
-            timer.Interval = cfg.Interval;
+            if (cfg.LowPower && snapshotPath == null && !LowPower.IsActive())
+            {
+                cfg.LowPower = false;   // the plan was changed elsewhere (Windows settings, or the copy was removed)
+                cfg.LowPowerByAuto = false;
+                cfg.Save();
+            }
+            timer.Interval = EffectiveInterval();
             timer.Tick += OnTick;
             timer.Start();
 
@@ -338,6 +349,7 @@ namespace CoreGlance
             if (tick % 3 == 0) UpdateSelfUsage();
             if (snapshotPath != null) { if (tick >= (healthSnapshot ? 15 : 8)) TakeSnapshot(); return; }
             UpdateTray();
+            CheckAutoLowPower();
             CheckFullscreen();
             if (Visible) Invalidate();
             if (tick == 5) TrimMemory();
@@ -644,12 +656,18 @@ namespace CoreGlance
             foreach (int v in new[] { 500, 1000, 2000, 5000 })
             {
                 int ms = v;
-                ToolStripMenuItem it = Item(ms < 1000 ? "0.5 s" : (ms / 1000) + " s", delegate { cfg.Interval = ms; timer.Interval = ms; cfg.Save(); });
+                ToolStripMenuItem it = Item(ms < 1000 ? "0.5 s" : (ms / 1000) + " s", delegate { cfg.Interval = ms; timer.Interval = EffectiveInterval(); cfg.Save(); });
                 it.Tag = ms;
                 refresh.DropDownItems.Add(it);
                 intervalItems.Add(it);
             }
 
+            var lowPowerMenu = new ToolStripMenuItem("Low power mode");
+            miLowOff = Item("Off", delegate { SetLowPower(false, cfg.LowPowerLevel, false); });
+            miLowSaver = Item("Battery saver (CPU up to 2.0 GHz)", delegate { SetLowPower(true, 0, false); });
+            miLowMax = Item("Max saver (1.6 GHz, efficient cores first)", delegate { SetLowPower(true, 1, false); });
+            miLowAuto = Item("Turn on automatically on battery", delegate { cfg.LowPowerAuto = !cfg.LowPowerAuto; cfg.Save(); lastOnAC = true; });
+            lowPowerMenu.DropDownItems.AddRange(new ToolStripItem[] { miLowOff, miLowSaver, miLowMax, new ToolStripSeparator(), miLowAuto });
             miAuto = Item("Start with Windows", delegate { Settings.SetAutoStart(!Settings.IsAutoStart()); });
             miSensors = Item("Enable temperatures && fans (admin)...", delegate { ToggleSensorMode(); });
             miPawn = Item("Advanced CPU sensors (install PawnIO)...", delegate { InstallAdvancedSensors(); });
@@ -661,6 +679,7 @@ namespace CoreGlance
                 new ToolStripSeparator(),
                 view, cpuMetric, miTaskbar, miTop, miLock, miClick, miFull, opacity, refresh,
                 new ToolStripSeparator(),
+                lowPowerMenu,
                 miAuto,
                 miSensors,
                 miPawn,
@@ -688,6 +707,11 @@ namespace CoreGlance
             miClick.Checked = cfg.ClickThrough;
             miFull.Checked = cfg.HideFullscreen;
             miAuto.Checked = Settings.IsAutoStart();
+            miLowOff.Checked = !cfg.LowPower;
+            miLowSaver.Checked = cfg.LowPower && cfg.LowPowerLevel == 0;
+            miLowMax.Checked = cfg.LowPower && cfg.LowPowerLevel == 1;
+            miLowAuto.Checked = cfg.LowPowerAuto;
+            miLowOff.Enabled = miLowSaver.Enabled = miLowMax.Enabled = !lowBusy;
             miSensors.Visible = sens.NeedsAdmin || sens.Elevated;
             miPawn.Visible = sens.Ready && !sens.PawnIoInstalled;
             miSensors.Text = sens.Elevated ? "Admin sensor mode (on)" : "Enable temperatures && fans (admin)...";
@@ -721,6 +745,60 @@ namespace CoreGlance
             SaveLocation();
             tick = 0;
             Invalidate();
+        }
+
+        int EffectiveInterval() { return cfg.LowPower ? Math.Max(2000, cfg.Interval) : cfg.Interval; }   // the widget itself also saves power
+
+        /// <summary>Switches the power plan on a worker thread (powercfg takes about a second) and updates the widget.</summary>
+        void SetLowPower(bool on, int level, bool byAuto)
+        {
+            if (lowBusy || snapshotPath != null) return;
+            if (on == cfg.LowPower && (!on || level == cfg.LowPowerLevel)) return;
+            lowBusy = true;
+            string prev = cfg.LowPowerPrev;
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                string result = null;
+                bool ok;
+                try
+                {
+                    if (on) { result = LowPower.Enable(level, prev); ok = result != null; }
+                    else ok = LowPower.Disable(prev);
+                }
+                catch (Exception ex) { Settings.Log("low power: " + ex.Message); ok = false; }
+                try
+                {
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        lowBusy = false;
+                        if (!ok)
+                        {
+                            tray.ShowBalloonTip(5000, "Low power mode", on ? "Windows did not accept the power plan change. Nothing was changed." : "Could not switch back to your power plan. Choose one in Windows Settings > Power.", ToolTipIcon.Warning);
+                            return;
+                        }
+                        cfg.LowPower = on;
+                        cfg.LowPowerByAuto = on && byAuto;
+                        if (on) { cfg.LowPowerLevel = level; cfg.LowPowerPrev = result; }
+                        cfg.Save();
+                        timer.Interval = EffectiveInterval();
+                        Invalidate();
+                    });
+                }
+                catch (InvalidOperationException) { }   // closing
+            });
+        }
+
+        /// <summary>"Turn on automatically on battery": on when unplugged, off again when plugged in (only if it turned it on).</summary>
+        void CheckAutoLowPower()
+        {
+            if (!mon.HasBattery) return;
+            bool ac = mon.OnAC;
+            if (cfg.LowPowerAuto && !lowBusy)
+            {
+                if (!ac && lastOnAC && !cfg.LowPower) SetLowPower(true, cfg.LowPowerLevel, true);
+                else if (ac && !lastOnAC && cfg.LowPower && cfg.LowPowerByAuto) SetLowPower(false, cfg.LowPowerLevel, true);
+            }
+            lastOnAC = ac;
         }
 
         void SetCpuMetric(int m)
@@ -880,6 +958,7 @@ namespace CoreGlance
             if (btnView.Contains(p)) return 1;
             if (btnMin.Contains(p)) return 2;
             if (btnHealth.Contains(p)) return 3;
+            if (btnPower.Contains(p)) return 4;
             return 0;
         }
 
@@ -920,7 +999,8 @@ namespace CoreGlance
             if (b != 0 && b == downBtn)
             {
                 downBtn = 0;
-                if (b == 3) ShowHealth();
+                if (b == 4) SetLowPower(!cfg.LowPower, cfg.LowPowerLevel, false);
+                else if (b == 3) ShowHealth();
                 else if (b == 2) MinimizeWidget();
                 else SetView(cfg.View == 0 ? 1 : 0);
                 return;
@@ -985,6 +1065,7 @@ namespace CoreGlance
             tabGpu = RectangleF.Empty;
             btnView = RectangleF.Empty;
             btnHealth = RectangleF.Empty;
+            btnPower = RectangleF.Empty;
             btnMin = RectangleF.Empty;
 
             float h = cfg.View == 0 ? PaintCompact(g) : PaintFull(g, cfg.View == 2);
@@ -1022,11 +1103,15 @@ namespace CoreGlance
             float hr = btnView.X - 8 * S;
             if (mon.HasBattery && mon.BatteryPct >= 0)
             {
+                // The battery doubles as the low power switch.
                 float hx = hr;
-                string bt = mon.BatteryPct + "%";
-                Txt(g, bt, fSmall, TextMid, hx, y + 2 * S, 2, 0);
-                hx -= Measure(g, bt, fSmall) + 5 * S;
-                DrawBattery(g, hx - 17 * S, y + 4.5f * S);
+                string bt = (cfg.LowPower ? "Saver " : "") + mon.BatteryPct + "%";
+                float left = hx - Measure(g, bt, fSmall) - 5 * S - 17 * S;
+                btnPower = new RectangleF(left - 6 * S, y - 1 * S, hx - left + 10 * S, 19 * S);
+                if (cfg.LowPower || hoverBtn == 4)
+                    FillRound(g, B(cfg.LowPower ? Color.FromArgb(hoverBtn == 4 ? 70 : 45, Good) : Color.FromArgb(52, 57, 68)), btnPower, 9.5f * S);
+                Txt(g, bt, fSmall, cfg.LowPower ? Good : TextMid, hx, y + 2 * S, 2, 0);
+                DrawBattery(g, left, y + 4.5f * S);
             }
             y += 26 * S;
 
@@ -1199,6 +1284,7 @@ namespace CoreGlance
             string thr; Color tc;
             if (mon.PassiveLimit < 100) { thr = string.Format("Thermal limit {0:0}%", mon.PassiveLimit); tc = Bad; }
             else if (mon.PerfLimit < 99) { thr = string.Format("Speed limited {0:0}%", mon.PerfLimit); tc = Warn; }
+            else if (cfg.LowPower) { thr = LowPower.LevelName(cfg.LowPowerLevel) + " on"; tc = Good; }
             else { thr = "No throttling"; tc = TextLo; }
             Txt(g, thr, fSmall, tc, x1, y - 0.5f * S, 2, 0);
             y += 18 * S;
@@ -1530,7 +1616,7 @@ namespace CoreGlance
             using (var pen = new Pen(TextLo, Math.Max(1f, S)))
                 g.DrawRectangle(pen, x, y, w, h);
             g.FillRectangle(B(TextLo), x + w, y + 2.5f * S, 1.6f * S, 3 * S);
-            Color fill = mon.Charging ? CCpu : (mon.BatteryPct <= 20 && !mon.OnAC ? Bad : TextMid);
+            Color fill = cfg.LowPower ? Good : mon.Charging ? CCpu : (mon.BatteryPct <= 20 && !mon.OnAC ? Bad : TextMid);
             float iw = (w - 3 * S) * Math.Max(0, Math.Min(100, mon.BatteryPct)) / 100f;
             g.FillRectangle(B(fill), x + 1.5f * S, y + 1.5f * S, Math.Max(1f, iw), h - 3 * S);
         }
@@ -1691,6 +1777,12 @@ namespace CoreGlance
             {
                 c = hf.Level == Severity.Critical ? Bad : Warn;
                 s = "Health: " + hf.Title;
+                return;
+            }
+            if (cfg.LowPower)
+            {
+                c = Good;
+                s = LowPower.LevelName(cfg.LowPowerLevel) + ": " + LowPower.LevelSummary(cfg.LowPowerLevel);
                 return;
             }
             c = Good;

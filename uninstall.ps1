@@ -10,6 +10,16 @@ Remove-Item (Join-Path ([Environment]::GetFolderPath('Programs')) 'CoreGlance.ln
 Start-Sleep -Milliseconds 500
 Remove-Item (Join-Path $env:LOCALAPPDATA 'Programs\CoreGlance') -Recurse -Force -ErrorAction SilentlyContinue
 
+# Low power mode: go back to the plan it replaced, and remove its plan copy.
+$lowPlan = 'c0e61a5c-4c50-4d00-9000-0000000000a1'
+if ((powercfg /getactivescheme) -match $lowPlan) {
+    $ini = Join-Path $env:APPDATA 'CoreGlance\settings.ini'
+    $prev = if (Test-Path $ini) { (Get-Content $ini | Where-Object { $_ -like 'LowPowerPrev=*' }) -replace '^LowPowerPrev=', '' } else { '' }
+    if (-not $prev) { $prev = '381b4222-f694-41f0-9685-ff5bb260df2e' }   # Balanced
+    powercfg /setactive $prev
+}
+cmd.exe /c "powercfg /delete $lowPlan >nul 2>&1"
+
 # Admin parts (sensor mode): scheduled task + Program Files copy.
 cmd.exe /c "schtasks.exe /Query /TN CoreGlance >nul 2>&1"
 $taskExists = $LASTEXITCODE -eq 0
